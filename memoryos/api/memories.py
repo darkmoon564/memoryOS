@@ -1,6 +1,7 @@
 import uuid
 import math
 import json
+import hashlib
 from datetime import datetime, timezone
 from typing import List
 from fastapi import APIRouter, Query, HTTPException, BackgroundTasks
@@ -92,7 +93,6 @@ async def ingest_memory(data: MemoryIngest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail="Embedding model execution failed.")
 
     # Calculate fingerprint hash for idempotency
-    import hashlib
     content_clean = data.content.lower().strip()
     raw_fp = f"{data.user_id}:{data.workspace_id}:{content_clean}"
     fingerprint = hashlib.sha256(raw_fp.encode("utf-8")).hexdigest()
@@ -227,6 +227,7 @@ async def retrieve_context(data: MemoryRetrieve, format: str = Query("json", des
                 "MATCH (u:User {id: $user_id})-[:KNOWS_ABOUT]->(e:Entity) "
                 "WHERE toLower($query) CONTAINS toLower(e.name) "
                 "MATCH (e)-[r]->(target:Entity) "
+                "WHERE coalesce(r.is_active, true) = true "
                 "RETURN e.name AS source, type(r) AS rel, target.name AS target "
                 "LIMIT 10"
             )

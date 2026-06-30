@@ -45,11 +45,21 @@ NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=local_dev_password
 
-# LLM Extractor Settings
+# Entity Extraction LLM (choose one)
+
+# Option A: Any OpenAI-compatible API (OpenAI, Groq, Together, vLLM, LiteLLM)
+LLM_API_BASE=https://api.openai.com/v1
+LLM_API_KEY=sk-your-key-here
+LLM_MODEL=gpt-4o-mini
+
+# Option B: Ollama (local LLM, no API key needed)
 OLLAMA_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.2
+
+# Timeout for LLM calls in seconds (default: 15)
+LLM_TIMEOUT=15
 ```
-*Note: If Postgres or Neo4j are not running, MemoryOS automatically spins up a **zero-dependency fallback** using in-memory SQLite and a local mock graph database.*
+*Note: If no LLM is available, MemoryOS automatically falls back to a local **spaCy dependency parser** for entity extraction. If Postgres or Neo4j are not running, it uses an in-memory SQLite and mock graph database.*
 
 ### 3. Launch the Server
 ```bash
@@ -91,15 +101,14 @@ uvicorn memoryos.main:app --host 127.0.0.1 --port 8088
 
 ---
 
-## 🧪 Running Benchmarks & Tests
+## 🧪 Running Tests
 
-To run the accuracy and dialogue-session tests locally:
 ```bash
-# Run SVO / contradiction accuracy tests
+# Core accuracy tests (recall under noise, contradiction resolution, decay)
 python tests/test_accuracy.py
 
-# Run LoCoMo multi-session dialogue memory benchmark
-python tests/locomo_benchmark.py
+# Synthetic multi-session dialogue evaluation
+python tests/synthetic_multisession_eval.py
 ```
 
 ---

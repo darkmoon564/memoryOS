@@ -28,7 +28,8 @@ class MockNeo4jDriver:
             self.data["relationships"].append({
                 "source": source,
                 "target": target,
-                "type": rel_type
+                "type": rel_type,
+                "is_active": True
             })
         
         elif "type(r) = $rel_type" in query_string and "t.name <>" in query_string:
@@ -40,20 +41,20 @@ class MockNeo4jDriver:
             for rel in self.data["relationships"]:
                 if (rel["source"] == source and 
                     rel["type"] == rel_type and 
-                    rel["target"] != new_target):
+                    rel["target"] != new_target and
+                    rel.get("is_active", True)):
                     results.append({
                         "old_target": rel["target"],
                         "rel_type": rel["type"]
                     })
             return results
         
-        elif "DELETE r" in query_string and "old_target" in str(parameters):
+        elif "SET r.is_active = false" in query_string and "old_target" in str(parameters):
             old_target = parameters.get("old_target", "")
             source = parameters.get("source", "")
-            self.data["relationships"] = [
-                r for r in self.data["relationships"]
-                if not (r["source"] == source and r["target"] == old_target)
-            ]
+            for rel in self.data["relationships"]:
+                if rel["source"] == source and rel["target"] == old_target:
+                    rel["is_active"] = False
             
         elif "MATCH (u:User {id: $user_id})-[:KNOWS_ABOUT]->(e:Entity)" in query_string:
             query_text = parameters.get("query", "").lower()
@@ -63,7 +64,7 @@ class MockNeo4jDriver:
                 if ent_name in query_text:
                     matching_entities.append(ent_name)
             for rel in self.data["relationships"]:
-                if rel["source"] in matching_entities:
+                if rel["source"] in matching_entities and rel.get("is_active", True):
                     results.append({
                         "source": rel["source"],
                         "rel": rel["type"],

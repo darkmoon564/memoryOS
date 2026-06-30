@@ -49,7 +49,7 @@ def background_graph_ingest(memory_id: str, content: str, user_id: str, workspac
                 MATCH (s:Entity {{name: $source, workspace_id: $workspace_id}})
                 MATCH (t:Entity {{name: $target, workspace_id: $workspace_id}})
                 MERGE (s)-[r:{rel['type']}]->(t)
-                SET r.confidence = 0.9, r.created_at = datetime()
+                SET r.confidence = 0.9, r.created_at = datetime(), r.is_active = true
             """
             neo4j.query(rel_query, {
                 "source": rel["source"],

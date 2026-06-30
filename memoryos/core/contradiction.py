@@ -18,7 +18,7 @@ def resolve_contradictions(user_id: str, workspace_id: str, relationships: list,
             existing = neo4j.query(
                 "MATCH (s:Entity {name: $source, workspace_id: $workspace_id})"
                 "-[r]->(t:Entity) "
-                "WHERE type(r) = $rel_type AND t.name <> $target "
+                "WHERE type(r) = $rel_type AND t.name <> $target AND coalesce(r.is_active, true) = true "
                 "RETURN t.name AS old_target, type(r) AS rel_type",
                 {
                     "source": rel["source"],
@@ -34,10 +34,10 @@ def resolve_contradictions(user_id: str, workspace_id: str, relationships: list,
                         f"[Contradiction] Resolved: {rel['source']} {rel['type']} "
                         f"{old_rel.get('old_target', '?')} -> {rel['target']} (newer wins)"
                     )
-                    # Remove old conflicting edge
+                    # Soft-deactivate old conflicting edge to preserve history
                     neo4j.query(
                         f"MATCH (s:Entity {{name: $source, workspace_id: $workspace_id}})"
-                        f"-[r:{rel['type']}]->(t:Entity {{name: $old_target}}) DELETE r",
+                        f"-[r:{rel['type']}]->(t:Entity {{name: $old_target}}) SET r.is_active = false",
                         {
                             "source": rel["source"],
                             "workspace_id": workspace_id,

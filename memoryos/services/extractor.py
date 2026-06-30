@@ -1,11 +1,14 @@
 import os
-import re
 import json
 import requests
 import spacy
 from memoryos.config import logger
 
 nlp = None
+
+# ──────────────────────────────────────────────────────────────────────
+# spaCy Model Loader
+# ──────────────────────────────────────────────────────────────────────
 
 def load_spacy_model():
     """Dynamically load or download the lightweight spaCy model on first run."""
@@ -22,45 +25,148 @@ def load_spacy_model():
         nlp = spacy.load("en_core_web_sm")
     return nlp
 
-def extract_entities_and_relationships(content: str) -> dict:
-    """
-    Extracts entities and relationships from the memory content using Ollama (Llama 3.2 3B).
-    Falls back to a spaCy dependency-based grammatical parser if Ollama is unavailable.
-    """
-    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-    model_name = os.getenv("OLLAMA_MODEL", "llama3.2")
-    
-    system_prompt = (
-        "You are an expert entity extraction system. Analyze the sentence and extract entities and relationships. "
-        "Return the output STRICTLY in JSON format without markdown wraps, matching this JSON schema:\n"
-        "{\n"
-        "  \"entities\": [{\"name\": \"entity_name\", \"type\": \"Person|Organization|Language|Technology|Product|Location\"}],\n"
-        "  \"relationships\": [{\"source\": \"entity_name\", \"target\": \"entity_name\", \"type\": \"WORKS_AT|INTERESTED_IN|USES|LIVES_IN|KNOWS\", \"properties\": {}}]\n"
-        "}\n"
-        "Ensure entity names are singular and lowercase."
-    )
+# ──────────────────────────────────────────────────────────────────────
+# LLM Extraction Prompt
+# ──────────────────────────────────────────────────────────────────────
 
+EXTRACTION_SYSTEM_PROMPT = (
+    "You are an expert entity extraction system. Analyze the sentence and extract entities and relationships. "
+    "Return the output STRICTLY in JSON format without markdown wraps, matching this JSON schema:\n"
+    "{\n"
+    "  \"entities\": [{\"name\": \"entity_name\", \"type\": \"Person|Organization|Language|Technology|Product|Location\"}],\n"
+    "  \"relationships\": [{\"source\": \"entity_name\", \"target\": \"entity_name\", \"type\": \"WORKS_AT|INTERESTED_IN|USES|LIVES_IN|KNOWS\", \"properties\": {}}]\n"
+    "}\n"
+    "Ensure entity names are singular and lowercase."
+)
+
+# ──────────────────────────────────────────────────────────────────────
+# LLM API Extraction (OpenAI-compatible or Ollama)
+# ──────────────────────────────────────────────────────────────────────
+
+def _extract_via_llm_api(content: str) -> dict | None:
+    """
+    Attempts extraction using a configurable LLM API.
+    
+    Supports two modes (set via environment variables):
+    
+    1. OpenAI-compatible API (works with OpenAI, Groq, Together, vLLM, LiteLLM):
+       LLM_API_BASE=https://api.openai.com/v1
+       LLM_API_KEY=sk-...
+       LLM_MODEL=gpt-4o-mini
+    
+    2. Ollama (local LLM, legacy):
+       OLLAMA_URL=http://localhost:11434
+       OLLAMA_MODEL=llama3.2
+    
+    Returns the parsed extraction dict, or None if the LLM call fails.
+    """
+    timeout = float(os.getenv("LLM_TIMEOUT", "15.0"))
+    
+    # ── Mode 1: OpenAI-compatible API ──
+    llm_api_base = os.getenv("LLM_API_BASE")
+    llm_api_key = os.getenv("LLM_API_KEY")
+    llm_model = os.getenv("LLM_MODEL")
+    
+    if llm_api_base and llm_api_key and llm_model:
+        try:
+            url = f"{llm_api_base.rstrip('/')}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {llm_api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": llm_model,
+                "messages": [
+                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": content}
+                ],
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"}
+            }
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                raw_text = response.json()["choices"][0]["message"]["content"]
+                result = json.loads(raw_text)
+                logger.info(f"[Extractor] Entity extraction completed via LLM API ({llm_model})")
+                return result
+            else:
+                logger.warning(f"LLM API returned status {response.status_code}: {response.text[:200]}")
+        except Exception as e:
+            logger.warning(f"LLM API extraction failed: {e}")
+        return None
+    
+    # ── Mode 2: Ollama (local LLM) ──
+    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+    
     try:
         response = requests.post(
             f"{ollama_url}/api/chat",
             json={
-                "model": model_name,
+                "model": ollama_model,
                 "messages": [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
                     {"role": "user", "content": content}
                 ],
                 "format": "json",
                 "stream": False
             },
-            timeout=3.0
+            timeout=timeout
         )
         if response.status_code == 200:
             raw_text = response.json().get("message", {}).get("content", "")
-            return json.loads(raw_text)
+            result = json.loads(raw_text)
+            logger.info(f"[Extractor] Entity extraction completed via Ollama ({ollama_model})")
+            return result
     except Exception as e:
         logger.warning(f"Ollama extraction failed: {e}. Using spaCy-based fallback parser.")
     
+    return None
+
+# ──────────────────────────────────────────────────────────────────────
+# Main Extraction Entry Point
+# ──────────────────────────────────────────────────────────────────────
+
+def extract_entities_and_relationships(content: str) -> dict:
+    """
+    Extracts entities and relationships from memory content.
+    
+    Extraction priority:
+    1. LLM API (OpenAI-compatible or Ollama) — highest quality, requires network/model
+    2. spaCy dependency parser — offline fallback, grammatical SVO extraction
+    """
+    # Try LLM first
+    llm_result = _extract_via_llm_api(content)
+    if llm_result:
+        return llm_result
+    
+    # Fallback to spaCy
+    logger.info("[Extractor] Using spaCy dependency parser fallback")
     return _spacy_dependency_extractor(content)
+
+# ──────────────────────────────────────────────────────────────────────
+# spaCy SVO Dependency Extractor (Offline Fallback)
+# ──────────────────────────────────────────────────────────────────────
+
+# Maps spaCy NER labels to our entity type taxonomy
+NER_TYPE_MAP = {
+    "ORG": "Organization",
+    "GPE": "Location",
+    "LOC": "Location",
+    "PERSON": "Person",
+    "PRODUCT": "Technology",
+    "WORK_OF_ART": "Product",
+    "LANGUAGE": "Language",
+    "NORP": "Organization",
+    "FAC": "Location",
+}
+
+def _resolve_entity_type(doc, token, fallback: str = "Entity") -> str:
+    """Resolve entity type using spaCy's built-in NER labels if available."""
+    for ent in doc.ents:
+        if token.idx >= ent.start_char and token.idx < ent.end_char:
+            return NER_TYPE_MAP.get(ent.label_, fallback)
+    return fallback
 
 def get_chunk_text(doc, token) -> str:
     """Retrieve full noun chunk containing the token, cleaned of leading articles/determiners."""
@@ -77,6 +183,7 @@ def _spacy_dependency_extractor(content: str) -> dict:
     """
     A spaCy-based Subject-Verb-Object (SVO) dependency extraction fallback.
     Traverses the grammatical dependency tree to find relationships and normalize entities.
+    Uses spaCy's built-in NER to resolve entity types (Person, Organization, Location, etc.).
     """
     nlp = load_spacy_model()
     doc = nlp(content)
@@ -86,17 +193,31 @@ def _spacy_dependency_extractor(content: str) -> dict:
     # Verb lemmas mapped to unified database relationship types
     verb_mappings = {
         "work": "WORKS_AT",
+        "join": "WORKS_AT",
+        "employ": "WORKS_AT",
         "live": "LIVES_IN",
         "move": "LIVES_IN",
+        "relocate": "LIVES_IN",
+        "reside": "LIVES_IN",
         "use": "USES",
         "code": "USES",
         "program": "USES",
+        "build": "USES",
+        "write": "USES",
+        "switch": "USES",
         "prefer": "INTERESTED_IN",
         "love": "INTERESTED_IN",
         "like": "INTERESTED_IN",
         "hate": "INTERESTED_IN",
         "dislike": "INTERESTED_IN",
-        "enjoy": "INTERESTED_IN"
+        "enjoy": "INTERESTED_IN",
+        "study": "STUDIES_AT",
+        "graduate": "STUDIES_AT",
+        "attend": "STUDIES_AT",
+        "marry": "MARRIED_TO",
+        "drive": "DRIVES",
+        "speak": "SPEAKS",
+        "know": "KNOWS",
     }
     
     extracted_rels = set()
@@ -172,13 +293,17 @@ def _spacy_dependency_extractor(content: str) -> dict:
                 if rel_key not in extracted_rels:
                     extracted_rels.add(rel_key)
                     
+                    # Resolve entity types using spaCy NER labels
+                    source_type = "User" if source_clean == "user" else _resolve_entity_type(doc, subject_tok, "Person")
+                    target_type = _resolve_entity_type(doc, target_tok, "Entity")
+                    
                     data["entities"].append({
                         "name": source_clean,
-                        "type": "Person" if source_clean != "user" else "User"
+                        "type": source_type
                     })
                     data["entities"].append({
                         "name": target_clean,
-                        "type": "Entity"
+                        "type": target_type
                     })
                     data["relationships"].append({
                         "source": source_clean,

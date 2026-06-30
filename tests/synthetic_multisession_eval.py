@@ -49,14 +49,13 @@ def reset_db():
     except Exception:
         pass
 
-async def run_locomo():
+async def run_synthetic_eval():
     print("=" * 75)
-    # LoCoMo stands for Long Multi-Session Dialogue Memory
-    print("  MemoryOS v1.2.0 - LoCoMo Long Multi-Session Dialogue Benchmark")
+    print("  MemoryOS v1.2.0 - Synthetic Multi-Session Dialogue Evaluation")
     print("=" * 75)
     
-    user_id = "locomo_agent"
-    workspace_id = "locomo_workspace"
+    user_id = "eval_agent"
+    workspace_id = "eval_workspace"
     bg_tasks = BackgroundTasks()
     
     reset_db()
@@ -127,7 +126,7 @@ async def run_locomo():
         noise_text = f"Distractor Turn: {distractor_convs[i % len(distractor_convs)]} #{i}"
         await ingest_memory(
             MemoryIngest(
-                user_id="other_user", # Ingest under a different user to act as noise distractors
+                user_id="other_user",
                 content=noise_text,
                 workspace_id=workspace_id,
                 session_id=f"noise_session_{i // 10}"
@@ -137,11 +136,11 @@ async def run_locomo():
     print("  -> Ingested 50 noise turns successfully.")
 
     # ------------------------------------------------------------------
-    # Step 2: Run LoCoMo Retrieval Evaluation Queries
+    # Step 2: Run Dialogue Retrieval Evaluation Queries
     # ------------------------------------------------------------------
-    print("\n[Phase 3] Running LoCoMo evaluation queries...")
+    print("\n[Phase 3] Running dialogue evaluation queries...")
     
-    locomo_eval_queries = [
+    dialogue_eval_queries = [
         {
             "query": "Where does the agent live currently?",
             "expected": ["Berlin"],
@@ -170,7 +169,7 @@ async def run_locomo():
     
     results = []
     
-    for eval in locomo_eval_queries:
+    for eval in dialogue_eval_queries:
         latencies = []
         pass_accuracies = []
         contradiction_correct = True
@@ -200,7 +199,7 @@ async def run_locomo():
                 correct = all(exp.lower() in retrieved_text for exp in eval["expected"])
                 pass_accuracies.append(correct)
                 
-                # Check forbidden matching (to verify old values were deactivated)
+                # Check forbidden matching
                 if eval["forbidden"]:
                     has_forbidden = any(forb.lower() in retrieved_text for forb in eval["forbidden"])
                     if has_forbidden:
@@ -215,7 +214,7 @@ async def run_locomo():
         })
         
     print("\n" + "=" * 75)
-    print("  LoCoMo Benchmark Summary Report")
+    print("  Synthetic Dialogue Evaluation Summary Report")
     print("=" * 75)
     print(f"{'Evaluation Query':<45} | {'Status':<10} | {'Latency':<10}")
     print("-" * 75)
@@ -224,4 +223,4 @@ async def run_locomo():
     print("=" * 75)
 
 if __name__ == "__main__":
-    asyncio.run(run_locomo())
+    asyncio.run(run_synthetic_eval())
