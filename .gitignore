@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Environment / Local Secrets
+.env
+.env.*
+
+# Logs
+*.log
+tests/server.log
+
+# Databases & local fallbacks
+*.db
+*.sqlite
+
+# IDEs & System
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.gemini/
