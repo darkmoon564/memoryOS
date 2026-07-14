@@ -9,6 +9,8 @@ ENV/
 build/
 dist/
 *.egg-info/
+*.pyo
+*.pyd
 
 # Environment / Local Secrets
 .env
@@ -16,7 +18,6 @@ dist/
 
 # Logs
 *.log
-tests/server.log
 
 # Databases & local fallbacks
 *.db
@@ -28,3 +29,17 @@ tests/server.log
 .DS_Store
 Thumbs.db
 .gemini/
+
+# Documents / Reports (not source code)
+*.pdf
+
+# Personal notes / scratch files
+work.md
+todo.md
+memoryos_pitchdeck.md
+
+# Archive (old/legacy data)
+archive/
+
+# Test artifacts
+tests/server.log
