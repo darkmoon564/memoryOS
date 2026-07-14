@@ -86,6 +86,7 @@ class MockCursor:
         clean_query = re.sub(r"vector\(\d+\)", "TEXT", clean_query)
         clean_query = clean_query.replace("vector", "TEXT")
         clean_query = clean_query.replace("TIMESTAMP WITH TIME ZONE", "TIMESTAMP")
+        clean_query = clean_query.replace("JSONB", "TEXT")
         clean_query = re.sub(r"NUMERIC\(\d+,\s*\d+\)", "REAL", clean_query)
 
         # Remove PostgreSQL typecasts (e.g. ::uuid[], ::vector, ::text)

@@ -116,7 +116,9 @@ def run_tests():
     print("\n--- Test 3: STM Cache Verification ---")
     stm_items = stm_cache.get(user_id, "default")
     print(f"  STM cache entries for {user_id}: {len(stm_items)}")
-    assert len(stm_items) == len(samples), f"Expected {len(samples)} STM entries, got {len(stm_items)}"
+    # Compound sentences are now split into atomic events, yielding 7 entries from the 4 samples
+    expected_entries = 7
+    assert len(stm_items) == expected_entries, f"Expected {expected_entries} STM entries, got {len(stm_items)}"
     print(f"  [PASS] STM cache contains {len(stm_items)} recent memories")
     
     # ============================================================

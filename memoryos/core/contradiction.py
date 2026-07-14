@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from memoryos.config import logger
 from memoryos.db.postgres import get_postgres_conn
 
@@ -34,16 +35,39 @@ def resolve_contradictions(user_id: str, workspace_id: str, relationships: list,
                         f"[Contradiction] Resolved: {rel['source']} {rel['type']} "
                         f"{old_rel.get('old_target', '?')} -> {rel['target']} (newer wins)"
                     )
-                    # Soft-deactivate old conflicting edge to preserve history
+                    # Soft-deactivate old conflicting edge to preserve history and mark it superseded
+                    timestamp_str = datetime.now(timezone.utc).isoformat()
+                    old_target = old_rel.get("old_target", "")
+                    
                     neo4j.query(
                         f"MATCH (s:Entity {{name: $source, workspace_id: $workspace_id}})"
-                        f"-[r:{rel['type']}]->(t:Entity {{name: $old_target}}) SET r.is_active = false",
+                        f"-[r:{rel['type']}]->(t:Entity {{name: $old_target}}) "
+                        f"SET r.is_active = false, r.valid_to = $timestamp, r.superseded_by = $new_target",
                         {
                             "source": rel["source"],
                             "workspace_id": workspace_id,
-                            "old_target": old_rel.get("old_target", "")
+                            "old_target": old_target,
+                            "new_target": rel["target"],
+                            "timestamp": timestamp_str
                         }
                     )
+                    
+                    # Create SUPERSEDED_BY relationship between old and new targets
+                    neo4j.query(
+                        "MATCH (old_t:Entity {name: $old_target, workspace_id: $workspace_id}) "
+                        "MATCH (new_t:Entity {name: $new_target, workspace_id: $workspace_id}) "
+                        "MERGE (old_t)-[sr:SUPERSEDED_BY {relationship_type: $rel_type, subject: $source, workspace_id: $workspace_id}]->(new_t) "
+                        "SET sr.timestamp = $timestamp",
+                        {
+                            "old_target": old_target,
+                            "new_target": rel["target"],
+                            "rel_type": rel["type"],
+                            "source": rel["source"],
+                            "workspace_id": workspace_id,
+                            "timestamp": timestamp_str
+                        }
+                    )
+                    
                     resolved_count += 1
                     
                     # Also deactivate old memories containing the contradicted fact

@@ -9,6 +9,8 @@ from memoryos.api.tools import router as tools_router
 # Logic & Utils
 from memoryos.config import logger
 from memoryos.core.scorer import _execute_decay_logic
+from memoryos.core.reflection import start_reflection_daemon
+from memoryos.db.neo4j import get_neo4j_conn
 
 _decay_timer = None
 
@@ -35,6 +37,14 @@ async def lifespan(app: FastAPI):
     _decay_timer = threading.Timer(60, run_decay_sweep)  # First run after 60s
     _decay_timer.daemon = True
     _decay_timer.start()
+    
+    logger.info("[Startup] Starting offline reflection daemon...")
+    try:
+        neo4j = get_neo4j_conn()
+        start_reflection_daemon(neo4j)
+    except Exception as e:
+        logger.error(f"[Startup] Failed to start reflection daemon: {e}")
+        
     yield
     if _decay_timer:
         _decay_timer.cancel()
