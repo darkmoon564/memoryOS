@@ -1,4 +1,5 @@
 import os
+os.environ["TESTING"] = "1"
 import sys
 
 # Ensure package is in path if run directly

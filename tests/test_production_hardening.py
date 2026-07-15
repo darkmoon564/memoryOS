@@ -1,4 +1,5 @@
 import os
+os.environ["TESTING"] = "1"
 import sys
 import asyncio
 import time
@@ -20,6 +21,16 @@ from memoryos.api.memories import (
     get_job_status
 )
 from memoryos.services.background import background_graph_ingest
+
+def seed_api_key(key: str, workspace_id: str):
+    conn = get_postgres_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO api_keys (key, workspace_id, description) VALUES (%s, %s, %s) ON CONFLICT (key) DO NOTHING",
+            (key, workspace_id, "Test API Key")
+        )
+    conn.commit()
+    conn.close()
 
 def test_production_hardening_suite():
     print("============================================================")
@@ -49,6 +60,8 @@ def test_production_hardening_suite():
 
     # 2. Workspace API Key Verification
     print("\nStep 2: Verifying workspace API key authorization...")
+    seed_api_key("key_default", "default")
+    seed_api_key("key_api_test", "api_test")
     # Disable testing env bypass to run active check
     old_force = os.environ.get("FORCE_AUTH_TEST")
     os.environ["FORCE_AUTH_TEST"] = "1"

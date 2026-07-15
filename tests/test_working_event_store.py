@@ -1,4 +1,5 @@
 import os
+os.environ["TESTING"] = "1"
 import sys
 import asyncio
 from datetime import datetime, timezone

@@ -59,10 +59,6 @@ def verify_workspace_key(workspace_id: str, authorization: Optional[str]):
             cur.execute("SELECT workspace_id FROM api_keys WHERE key = %s", (key,))
             row = cur.fetchone()
             if not row:
-                if key in ["key_default", "default_key"] and workspace_id == "default":
-                    return
-                if key == "key_api_test" and workspace_id in ["api_test", "default"]:
-                    return
                 raise HTTPException(status_code=403, detail="Invalid API key credentials.")
             
             db_workspace = row[0] if not isinstance(row, dict) else row["workspace_id"]
