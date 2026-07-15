@@ -1,5 +1,12 @@
-from pydantic import BaseModel, Field
+import re
+from pydantic import BaseModel, Field, validator
 from typing import List, Optional
+
+def validate_id_string(v: str) -> str:
+    if v is not None:
+        if not re.match(r"^[a-zA-Z0-9_\-]+$", v):
+            raise ValueError("ID must contain only alphanumeric characters, underscores, and hyphens (no spaces, slashes, or special characters).")
+    return v
 
 class MemoryIngest(BaseModel):
     user_id: str = Field(..., description="ID of the user")
@@ -7,12 +14,32 @@ class MemoryIngest(BaseModel):
     workspace_id: str = Field("default", description="Workspace separation parameter")
     session_id: Optional[str] = Field(None, description="Optional active session ID")
 
+    @validator("user_id", "workspace_id")
+    def check_ids(cls, v):
+        return validate_id_string(v)
+
+    @validator("content")
+    def check_content_length(cls, v):
+        if len(v) > 10000:
+            raise ValueError("Memory content size exceeds maximum limit of 10000 characters.")
+        return v
+
 class MemoryRetrieve(BaseModel):
     user_id: str = Field(..., description="ID of the user")
     query: str = Field(..., description="The query to search memories for")
     workspace_id: str = Field("default", description="Workspace separation parameter")
     limit: int = Field(5, ge=1, le=20, description="Max memories to return")
     current_goal: Optional[str] = Field(None, description="Optional active agent goal to align retrieval context")
+
+    @validator("user_id", "workspace_id")
+    def check_ids(cls, v):
+        return validate_id_string(v)
+
+    @validator("query")
+    def check_query_length(cls, v):
+        if len(v) > 1000:
+            raise ValueError("Query size exceeds maximum limit of 1000 characters.")
+        return v
 
 class IngestResponse(BaseModel):
     status: str
@@ -42,12 +69,26 @@ class MemoryReflect(BaseModel):
     user_id: str = Field(..., description="ID of the user")
     workspace_id: str = Field("default", description="Workspace separation parameter")
 
+    @validator("user_id", "workspace_id")
+    def check_ids(cls, v):
+        return validate_id_string(v)
+
 class WorkflowIngest(BaseModel):
     user_id: str = Field(..., description="ID of the user")
     workspace_id: str = Field("default", description="Workspace separation parameter")
     name: str = Field(..., description="Name of the workflow")
     description: Optional[str] = Field(None, description="Detailed workflow description")
     steps: List[str] = Field(..., description="Ordered step description strings")
+
+    @validator("user_id", "workspace_id")
+    def check_ids(cls, v):
+        return validate_id_string(v)
+
+    @validator("name")
+    def check_name_length(cls, v):
+        if len(v) > 256:
+            raise ValueError("Workflow name exceeds maximum limit of 256 characters.")
+        return v
 
 class WorkflowResponse(BaseModel):
     status: str
@@ -62,6 +103,10 @@ class WorkingMemoryUpdate(BaseModel):
     current_plan: Optional[List[str]] = Field(None, description="List of plan items")
     scratchpad: Optional[str] = Field(None, description="General notes/thoughts")
     retained_facts: Optional[List[str]] = Field(None, description="Retained short-term facts")
+
+    @validator("user_id", "workspace_id")
+    def check_ids(cls, v):
+        return validate_id_string(v)
 
 class WorkingMemoryResponse(BaseModel):
     user_id: str

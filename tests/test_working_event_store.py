@@ -14,7 +14,8 @@ from memoryos.api.memories import (
     get_working_memory,
     ingest_memory,
     retrieve_context,
-    trigger_state_replay
+    trigger_replay,
+    get_job_status
 )
 from memoryos.schemas.memory import (
     WorkingMemoryUpdate,
@@ -145,9 +146,34 @@ def test_working_event_store_system():
         user_id=user_id,
         workspace_id=workspace_id
     )
-    res_replay = asyncio.run(trigger_state_replay(req_replay))
-    print(f"  Replay response: {res_replay}")
-    assert res_replay["status"] == "success"
+    
+    # We pass Header token key_default for authentication
+    from fastapi import BackgroundTasks
+    import time
+    bg = BackgroundTasks()
+    
+    async def run_replay_with_polling():
+        # Trigger replay, retrieve job_id
+        res = await trigger_replay(req_replay, bg, authorization="key_default")
+        job_id = res["job_id"]
+        print(f"  Queued Replay Job ID: {job_id}")
+        
+        # Manually run the queued background task since we are calling it in a test runner context
+        # (FastAPI doesn't automatically execute background tasks unless route is run within HTTP pipeline)
+        from memoryos.core.event_store import replay_events
+        await replay_events(job_id, user_id, workspace_id)
+        
+        # Poll job status
+        for _ in range(10):
+            job_info = await get_job_status(job_id, authorization="key_default")
+            if job_info["status"] in ["COMPLETED", "FAILED"]:
+                return job_info
+            time.sleep(0.1)
+        return await get_job_status(job_id, authorization="key_default")
+        
+    res_replay = asyncio.run(run_replay_with_polling())
+    print(f"  Replay job result: {res_replay}")
+    assert res_replay["status"] == "COMPLETED", f"Expected COMPLETED, got {res_replay['status']}"
     
     # Verify that memories are restored
     with conn.cursor() as cur:

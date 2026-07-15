@@ -152,9 +152,9 @@ class MockNeo4jDriver:
             confidence = parameters.get("confidence", 0.9)
             workspace_id = parameters.get("workspace_id")
             
-            rel_type = "KNOWS_ABOUT"
-            for r_type in ["WORKS_AT", "INTERESTED_IN", "USES", "LIVES_IN", "KNOWS"]:
-                if r_type in query_string:
+            rel_type = "RELATED_TO"
+            for r_type in ["WORKS_AT", "INTERESTED_IN", "USES", "LIVES_IN", "KNOWS", "RELATED_TO", "KNOWS_ABOUT", "LEARNING_TOPIC", "BELONGS_TO_TOPIC", "HAS_PROFILE", "BELONGS_TO_PROFILE", "HAS_WORKFLOW", "USES_TECH", "SUPERSEDED_BY"]:
+                if f":{r_type}" in query_string or f"r:{r_type}" in query_string or r_type in query_string:
                     rel_type = r_type
                     break
             
@@ -513,3 +513,13 @@ def get_neo4j_conn():
             logger.error(f"Failed to connect to Neo4j: {e}. Graph features will run in mock mode.")
             _neo4j_conn = None
     return _neo4j_conn
+
+def close_neo4j_conn():
+    global _neo4j_conn
+    if _neo4j_conn is not None:
+        try:
+            _neo4j_conn.close()
+            logger.info("[Database] Neo4j Connection Driver closed successfully.")
+        except Exception as e:
+            logger.error(f"[Database] Error closing Neo4j connection: {e}")
+        _neo4j_conn = None

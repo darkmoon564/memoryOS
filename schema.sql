@@ -95,3 +95,38 @@ CREATE TABLE IF NOT EXISTS event_store (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_event_store_lookup ON event_store(user_id, workspace_id);
+
+-- Workspace API Keys
+CREATE TABLE IF NOT EXISTS api_keys (
+    key VARCHAR(128) PRIMARY KEY,
+    workspace_id VARCHAR(64) NOT NULL,
+    description VARCHAR(256),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Dead Letter Queue (failed_jobs)
+CREATE TABLE IF NOT EXISTS dead_letter_queue (
+    id UUID PRIMARY KEY,
+    user_id VARCHAR(64) NOT NULL,
+    workspace_id VARCHAR(64) NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    payload JSONB NOT NULL,
+    error_message TEXT NOT NULL,
+    failed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Async Background Jobs (for Replay/Rebuild operations)
+CREATE TABLE IF NOT EXISTS background_jobs (
+    id UUID PRIMARY KEY,
+    job_type VARCHAR(64) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    workspace_id VARCHAR(64) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'QUEUED',
+    total_events INT DEFAULT 0,
+    processed_events INT DEFAULT 0,
+    error_message TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_background_jobs_lookup ON background_jobs(user_id, workspace_id);
+

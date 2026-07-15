@@ -113,7 +113,7 @@ def test_consolidation_system():
     req = MemoryReflect(user_id=user_id, workspace_id=workspace_id)
     
     import asyncio
-    api_res = asyncio.run(trigger_consolidation(req))
+    api_res = asyncio.run(trigger_consolidation(req, authorization="key_default"))
     print(f"  API Response status: {api_res['status']}")
     assert api_res["status"] == "success"
     

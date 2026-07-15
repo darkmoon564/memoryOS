@@ -11,7 +11,7 @@ nlp = None
 # ──────────────────────────────────────────────────────────────────────
 
 def load_spacy_model():
-    """Dynamically load or download the lightweight spaCy model on first run."""
+    """Dynamically load the lightweight spaCy model on first run. Does not perform runtime downloads."""
     global nlp
     if nlp is not None:
         return nlp
@@ -19,11 +19,49 @@ def load_spacy_model():
     try:
         nlp = spacy.load("en_core_web_sm")
     except OSError:
-        logger.info("Downloading lightweight spaCy model (en_core_web_sm)...")
-        from spacy.cli import download
-        download("en_core_web_sm")
-        nlp = spacy.load("en_core_web_sm")
+        logger.warning(
+            "spaCy model 'en_core_web_sm' is not pre-installed. "
+            "Offline extraction will fall back to simple regex-based parser. "
+            "To resolve, run: python -m spacy download en_core_web_sm"
+        )
+        nlp = None
     return nlp
+
+def _regex_relationship_extractor(content: str) -> dict:
+    """Fallback rule-based relationship parser when spaCy is not available."""
+    data = {"entities": [], "relationships": []}
+    content_lower = content.lower().strip()
+    
+    import re
+    m_work = re.search(r"(\b[a-z0-9_\-]+)\s+(?:works\s+at|employed\s+at)\s+([a-z0-9_\-\s\.]+)", content_lower)
+    if m_work:
+        subj = m_work.group(1).strip()
+        obj = m_work.group(2).rstrip(".").strip()
+        data["entities"].extend([{"name": subj, "type": "Person"}, {"name": obj, "type": "Organization"}])
+        data["relationships"].append({"source": subj, "target": obj, "type": "WORKS_AT", "properties": {}})
+        
+    m_live = re.search(r"(\b[a-z0-9_\-]+)\s+(?:lives\s+in|located\s+in)\s+([a-z0-9_\-\s\.]+)", content_lower)
+    if m_live:
+        subj = m_live.group(1).strip()
+        obj = m_live.group(2).rstrip(".").strip()
+        data["entities"].extend([{"name": subj, "type": "Person"}, {"name": obj, "type": "Location"}])
+        data["relationships"].append({"source": subj, "target": obj, "type": "LIVES_IN", "properties": {}})
+        
+    m_use = re.search(r"(\b[a-z0-9_\-]+)\s+(?:uses|using)\s+([a-z0-9_\-\s\.]+)", content_lower)
+    if m_use:
+        subj = m_use.group(1).strip()
+        obj = m_use.group(2).rstrip(".").strip()
+        data["entities"].extend([{"name": subj, "type": "Person"}, {"name": obj, "type": "Technology"}])
+        data["relationships"].append({"source": subj, "target": obj, "type": "USES", "properties": {}})
+        
+    m_like = re.search(r"(\b[a-z0-9_\-]+)\s+(?:loves|likes|interested\s+in)\s+([a-z0-9_\-\s\.]+)", content_lower)
+    if m_like:
+        subj = m_like.group(1).strip()
+        obj = m_like.group(2).rstrip(".").strip()
+        data["entities"].extend([{"name": subj, "type": "Person"}, {"name": obj, "type": "Entity"}])
+        data["relationships"].append({"source": subj, "target": obj, "type": "INTERESTED_IN", "properties": {}})
+        
+    return data
 
 # ──────────────────────────────────────────────────────────────────────
 # LLM Extraction Prompt
@@ -186,6 +224,8 @@ def _spacy_dependency_extractor(content: str) -> dict:
     Uses spaCy's built-in NER to resolve entity types (Person, Organization, Location, etc.).
     """
     nlp = load_spacy_model()
+    if nlp is None:
+        return _regex_relationship_extractor(content)
     doc = nlp(content)
     
     data = {"entities": [], "relationships": []}

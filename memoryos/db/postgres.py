@@ -218,12 +218,83 @@ class MockPostgresConnection:
     def close(self):
         pass
 
+from psycopg2.pool import ThreadedConnectionPool
+
+_postgres_pool = None
+
+def init_postgres_pool():
+    global _postgres_pool
+    if _postgres_pool is not None:
+        return
+    import memoryos.config as config
+    if config._use_postgres_fallback:
+        return
+    try:
+        _postgres_pool = ThreadedConnectionPool(
+            minconn=1,
+            maxconn=20,
+            host=os.getenv("POSTGRES_HOST", "localhost"),
+            database=os.getenv("POSTGRES_DB", "memoryos"),
+            user=os.getenv("POSTGRES_USER", "postgres"),
+            password=os.getenv("POSTGRES_PASSWORD", "local_dev_password"),
+            port=int(os.getenv("POSTGRES_PORT", 5432)),
+            connect_timeout=1
+        )
+        logger.info("[Database] Threaded Postgres Connection Pool initialized successfully.")
+    except Exception as e:
+        logger.error(f"[Database] Failed to initialize Threaded Connection Pool: {e}. Operating with fallback mode.")
+        config._use_postgres_fallback = True
+
+def close_postgres_pool():
+    global _postgres_pool
+    if _postgres_pool is not None:
+        try:
+            _postgres_pool.closeall()
+            logger.info("[Database] Threaded Postgres Connection Pool closed successfully.")
+        except Exception as e:
+            logger.error(f"[Database] Error closing connection pool: {e}")
+        _postgres_pool = None
+
+class PooledConnectionWrapper:
+    def __init__(self, conn, pool):
+        self._conn = conn
+        self._pool = pool
+        
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+        
+    def close(self):
+        if self._pool and self._conn:
+            self._pool.putconn(self._conn)
+            self._conn = None
+            self._pool = None
+        elif self._conn:
+            self._conn.close()
+            self._conn = None
+            
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
 def get_postgres_conn():
     """Establishes connection to PostgreSQL or falls back to Mock SQLite connection."""
     import memoryos.config as config
     if config._use_postgres_fallback:
         return MockPostgresConnection()
         
+    global _postgres_pool
+    if _postgres_pool is None:
+        init_postgres_pool()
+        
+    if _postgres_pool is not None:
+        try:
+            conn = _postgres_pool.getconn()
+            return PooledConnectionWrapper(conn, _postgres_pool)
+        except Exception as e:
+            logger.warning(f"Failed to fetch connection from pool: {e}. Falling back to single-use connection.")
+            
     try:
         conn = psycopg2.connect(
             host=os.getenv("POSTGRES_HOST", "localhost"),
