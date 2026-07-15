@@ -124,4 +124,6 @@ def test_consolidation_system():
     print("=" * 60)
 
 if __name__ == "__main__":
-    test_consolidation_system()
+    from unittest.mock import patch
+    with patch("memoryos.api.memories.verify_workspace_key", return_value=None):
+        test_consolidation_system()

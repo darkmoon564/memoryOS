@@ -42,9 +42,6 @@ def verify_workspace_key(workspace_id: str, authorization: Optional[str]):
     if authorization is not None and not isinstance(authorization, str):
         authorization = None
     if not authorization:
-        import os
-        if os.getenv("TESTING") == "1" and os.getenv("FORCE_AUTH_TEST") != "1":
-            return
         raise HTTPException(
             status_code=401,
             detail="Missing Authorization Header. Please provide Bearer <key>."

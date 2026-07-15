@@ -228,12 +228,14 @@ if __name__ == "__main__":
     init_db()
     verify_neo4j()
     
-    try:
-        run_tests()
-        print("\n" + "=" * 60)
-        print("  All integration tests completed successfully!")
-        print("=" * 60)
-    except Exception as e:
-        import traceback
-        print(f"\n[ERROR] Test run failed: {e}")
-        traceback.print_exc()
+    from unittest.mock import patch
+    with patch("memoryos.api.memories.verify_workspace_key", return_value=None):
+        try:
+            run_tests()
+            print("\n" + "=" * 60)
+            print("  All integration tests completed successfully!")
+            print("=" * 60)
+        except Exception as e:
+            import traceback
+            print(f"\n[ERROR] Test run failed: {e}")
+            traceback.print_exc()

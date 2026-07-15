@@ -9,7 +9,7 @@ from typing import Optional
 from memoryos.config import logger
 from memoryos.db.postgres import get_postgres_conn
 from memoryos.db.neo4j import get_neo4j_conn, _mock_graph_data
-from memoryos.services.background import ALLOWED_RELATIONSHIPS, insert_to_dlq
+from memoryos.services.background import insert_to_dlq
 
 _is_replaying = False
 
@@ -71,6 +71,16 @@ def update_job_status(job_id: str, status: str, total_events: int = 0, processed
 # ──────────────────────────────────────────────────────────────────────
 
 def restore_precomputed_clauses(user_id: str, session_id: Optional[str], workspace_id: str, clauses: list):
+    # Ensure User node is created in Neo4j
+    from memoryos.services.background import _execute_graph_inserts
+    neo4j = get_neo4j_conn()
+    if neo4j:
+        is_mock = getattr(neo4j, "is_mock", False)
+        if not is_mock:
+            neo4j.query("MERGE (u:User {id: $user_id, workspace_id: $workspace_id})", {
+                "user_id": user_id, "workspace_id": workspace_id
+            })
+
     conn = get_postgres_conn()
     with conn.cursor() as cur:
         cur.execute("INSERT INTO users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (user_id,))
@@ -98,86 +108,96 @@ def restore_precomputed_clauses(user_id: str, session_id: Optional[str], workspa
                 """,
                 (evt_id, user_id, session_id, workspace_id, evt, embedding, memory_type, importance, fingerprint)
             )
+            # Execute Neo4j inserts using the same queries as live ingestion path
+            clause_graph = {
+                "entities": item.get("entities", []),
+                "relationships": item.get("relationships", [])
+            }
+            try:
+                _execute_graph_inserts(evt_id, user_id, workspace_id, clause_graph)
+            except Exception as graph_err:
+                logger.error(f"[ReplayEngine] Failed to restore graph structures for clause: {graph_err}")
+                
     conn.commit()
     conn.close()
 
-def restore_precomputed_graph(user_id: str, workspace_id: str, payload: dict):
+# ──────────────────────────────────────────────────────────────────────
+def execute_workflow_ingest(user_id: str, workspace_id: str, name: str, description: Optional[str], steps: list):
+    """Saves workflow procedural step data in postgres/neo4j directly without HTTP route endpoints."""
+    conn = get_postgres_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO workflows (id, user_id, workspace_id, name, description, steps)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (str(uuid.uuid4()), user_id, workspace_id, name, description, json.dumps(steps))
+        )
+    conn.commit()
+    conn.close()
+
     neo4j = get_neo4j_conn()
-    if not neo4j:
-        return
-        
-    entities = payload.get("entities", [])
-    relationships = payload.get("relationships", [])
-    
-    is_mock = getattr(neo4j, "is_mock", False)
-    if is_mock:
-        # Populate Mock Graph data
-        for ent in entities:
-            name = ent["name"]
+    if neo4j:
+        is_mock = getattr(neo4j, "is_mock", False)
+        if is_mock:
             _mock_graph_data["entities"][name] = {
                 "name": name,
-                "type": ent.get("type", "Entity"),
-                "workspace": workspace_id
+                "type": "Workflow",
+                "workspace": workspace_id,
+                "description": description
             }
-        for rel in relationships:
             _mock_graph_data["relationships"].append({
-                "source": rel["source"],
-                "target": rel["target"],
-                "type": rel["type"],
-                "workspace_id": workspace_id
-            })
-        return
-        
-    neo4j.query("MERGE (u:User {id: $user_id, workspace_id: $workspace_id})", {
-        "user_id": user_id, "workspace_id": workspace_id
-    })
-    
-    for ent in entities:
-        neo4j.query(
-            "MERGE (e:Entity {name: $name, workspace_id: $workspace_id}) SET e.type = $type",
-            {"name": ent["name"], "type": ent.get("type", "Entity"), "workspace_id": workspace_id}
-        )
-        neo4j.query(
-            """
-            MATCH (u:User {id: $user_id, workspace_id: $workspace_id})
-            MATCH (e:Entity {name: $name, workspace_id: $workspace_id})
-            MERGE (u)-[r:KNOWS_ABOUT]->(e)
-            """,
-            {"user_id": user_id, "name": ent["name"], "workspace_id": workspace_id}
-        )
-        
-    timestamp_str = datetime.now(timezone.utc).isoformat()
-    for rel in relationships:
-        rel_type = rel["type"].upper().strip()
-        if not re.match(r"^[A-Z][A-Z0-9_]*$", rel_type):
-            continue
-        if rel_type not in ALLOWED_RELATIONSHIPS:
-            rel_type = "RELATED_TO"
-            
-        neo4j.query(
-            f"""
-            MATCH (s:Entity {{name: $source, workspace_id: $workspace_id}})
-            MATCH (t:Entity {{name: $target, workspace_id: $workspace_id}})
-            MERGE (s)-[r:{rel_type}]->(t)
-            ON CREATE SET 
-                r.version = 1,
-                r.evidence_count = 1,
-                r.created_at = $timestamp,
-                r.valid_from = $timestamp,
-                r.valid_to = null,
-                r.workspace_id = $workspace_id,
-                r.is_active = true
-            ON MATCH SET 
-                r.version = coalesce(r.version, 1) + 1,
-                r.is_active = true
-            """,
-            {
-                "source": rel["source"],
-                "target": rel["target"],
+                "source": user_id,
+                "target": name,
+                "type": "HAS_WORKFLOW",
                 "workspace_id": workspace_id,
-                "timestamp": timestamp_str
-            }
-        )
+                "is_active": True
+            })
+        else:
+            neo4j.query(
+                """
+                MERGE (w:Workflow {name: $name, workspace_id: $workspace_id})
+                SET w.description = $description
+                """,
+                {"name": name, "description": description, "workspace_id": workspace_id}
+            )
+            neo4j.query(
+                """
+                MATCH (u:User {id: $user_id, workspace_id: $workspace_id})
+                MATCH (w:Workflow {name: $name, workspace_id: $workspace_id})
+                MERGE (u)-[r:HAS_WORKFLOW]->(w)
+                SET r.is_active = true
+                """,
+                {"user_id": user_id, "name": name, "workspace_id": workspace_id}
+            )
+            
+        tech_keywords = ["docker", "postgres", "sqlite", "neovim", "python", "rust", "railway", "github", "git"]
+        detected_techs = set()
+        for step in steps:
+            step_lower = step.lower()
+            for tech in tech_keywords:
+                if tech in step_lower:
+                    detected_techs.add(tech)
+                    
+        for tech in detected_techs:
+            if is_mock:
+                _mock_graph_data["relationships"].append({
+                    "source": name,
+                    "target": tech,
+                    "type": "USES_TECH",
+                    "workspace_id": workspace_id,
+                    "is_active": True
+                })
+            else:
+                neo4j.query(
+                    """
+                    MATCH (t:Entity {name: $tech, workspace_id: $workspace_id})
+                    MATCH (w:Workflow {name: $name, workspace_id: $workspace_id})
+                    MERGE (w)-[r:USES_TECH]->(t)
+                    SET r.is_active = true
+                    """,
+                    {"tech": tech, "name": name, "workspace_id": workspace_id}
+                )
 
 # ──────────────────────────────────────────────────────────────────────
 # Replay vs Rebuild Workers
@@ -241,7 +261,6 @@ async def replay_events(job_id: str, user_id: str, workspace_id: str = "default"
         total_events = len(events)
         update_job_status(job_id, "RUNNING", total_events=total_events, processed_events=0)
         
-        from memoryos.api.memories import trigger_consolidation, apply_decay
         from memoryos.schemas.memory import MemoryReflect
         
         processed_count = 0
@@ -254,28 +273,25 @@ async def replay_events(job_id: str, user_id: str, workspace_id: str = "default"
             if event_type == "MEMORY_INGESTED":
                 clauses = payload_data.get("clauses", [])
                 session_id = payload_data.get("session_id")
-                # Direct SQL restore of pre-computed embeddings and types
+                # Direct SQL & Neo4j restore of pre-computed embeddings and types
                 restore_precomputed_clauses(user_id, session_id, workspace_id, clauses)
-                # Direct Neo4j restore of pre-computed entities/relationships
-                restore_precomputed_graph(user_id, workspace_id, payload_data)
             elif event_type == "WORKFLOW_INGESTED":
-                # Restore workflow step data directly
-                conn = get_postgres_conn()
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO workflows (id, user_id, workspace_id, name, description, steps)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        """,
-                        (str(uuid.uuid4()), user_id, workspace_id, payload_data["name"], payload_data.get("description"), json.dumps(payload_data["steps"]))
-                    )
-                conn.commit()
-                conn.close()
+                # Restore workflow data directly
+                execute_workflow_ingest(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    name=payload_data["name"],
+                    description=payload_data.get("description"),
+                    steps=payload_data["steps"]
+                )
             elif event_type == "MEMORIES_CONSOLIDATED":
-                data_obj = MemoryReflect(**payload_data)
-                await trigger_consolidation(data_obj)
+                from memoryos.core.consolidation import consolidate_hierarchy
+                neo4j = get_neo4j_conn()
+                if neo4j:
+                    consolidate_hierarchy(user_id, workspace_id, neo4j)
             elif event_type == "MEMORY_DECAYED":
-                await apply_decay()
+                from memoryos.core.scorer import _execute_decay_logic
+                _execute_decay_logic()
                 
             processed_count += 1
             update_job_status(job_id, "RUNNING", total_events=total_events, processed_events=processed_count)
@@ -350,7 +366,6 @@ async def rebuild_events(job_id: str, user_id: str, workspace_id: str = "default
         
         from memoryos.services.ingestion import MemoryIngestionService
         from memoryos.schemas.memory import MemoryIngest, WorkflowIngest, MemoryReflect
-        from memoryos.api.memories import ingest_workflow, trigger_consolidation, apply_decay
         
         processed_count = 0
         for event in events:
@@ -372,13 +387,21 @@ async def rebuild_events(job_id: str, user_id: str, workspace_id: str = "default
                 # Pass background_tasks = None to run graph extraction synchronously in chronological order
                 await MemoryIngestionService.ingest(data_obj, background_tasks=None)
             elif event_type == "WORKFLOW_INGESTED":
-                data_obj = WorkflowIngest(**payload_data)
-                await ingest_workflow(data_obj)
+                execute_workflow_ingest(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    name=payload_data["name"],
+                    description=payload_data.get("description"),
+                    steps=payload_data["steps"]
+                )
             elif event_type == "MEMORIES_CONSOLIDATED":
-                data_obj = MemoryReflect(**payload_data)
-                await trigger_consolidation(data_obj)
+                from memoryos.core.consolidation import consolidate_hierarchy
+                neo4j = get_neo4j_conn()
+                if neo4j:
+                    consolidate_hierarchy(user_id, workspace_id, neo4j)
             elif event_type == "MEMORY_DECAYED":
-                await apply_decay()
+                from memoryos.core.scorer import _execute_decay_logic
+                _execute_decay_logic()
                 
             processed_count += 1
             update_job_status(job_id, "RUNNING", total_events=total_events, processed_events=processed_count)

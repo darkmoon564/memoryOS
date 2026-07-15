@@ -32,6 +32,15 @@ def seed_api_key(key: str, workspace_id: str):
     conn.commit()
     conn.close()
 
+def cleanup_api_keys():
+    conn = get_postgres_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM api_keys WHERE key IN (%s, %s)",
+            ("key_default", "key_api_test")
+        )
+    conn.commit()
+    conn.close()
 def test_production_hardening_suite():
     print("============================================================")
     print("  MemoryOS v1.2.0 - Stage 1 Production Hardening Verification")
@@ -203,6 +212,7 @@ def test_production_hardening_suite():
     assert health_res["dependencies"]["postgres"] == "connected"
     print("  Health endpoint active and returning connectivity state.")
     
+    cleanup_api_keys()
     conn.close()
     print("\n" + "=" * 60)
     print("  Stage 1 Production Hardening Verification SUCCESS!")

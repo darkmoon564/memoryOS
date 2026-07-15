@@ -144,4 +144,6 @@ def test_confidence_graph_system():
     print("=" * 60)
 
 if __name__ == "__main__":
-    test_confidence_graph_system()
+    from unittest.mock import patch
+    with patch("memoryos.api.memories.verify_workspace_key", return_value=None):
+        test_confidence_graph_system()

@@ -3,6 +3,7 @@ import time
 import json
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 from memoryos.config import logger
 from memoryos.db.neo4j import get_neo4j_conn
 from memoryos.services.extractor import extract_entities_and_relationships
@@ -14,6 +15,17 @@ ALLOWED_RELATIONSHIPS = {
     "LEARNING_TOPIC", "BELONGS_TO_TOPIC", "HAS_PROFILE", "BELONGS_TO_PROFILE",
     "HAS_WORKFLOW", "USES_TECH", "KNOWS_ABOUT", "SUPERSEDED_BY"
 }
+
+def sanitize_relationship_type(rel_type: str) -> Optional[str]:
+    """Validates the relationship type string for Cypher safety and whitelists."""
+    rel_type = rel_type.upper().strip()
+    if not re.match(r"^[A-Z][A-Z0-9_]*$", rel_type):
+        logger.warning(f"[Graph Safety] Discarding invalid relationship string: '{rel_type}' (Cypher injection block)")
+        return None
+    if rel_type not in ALLOWED_RELATIONSHIPS:
+        logger.info(f"[Graph Safety] Relationship '{rel_type}' not whitelisted. Mapping to RELATED_TO.")
+        return "RELATED_TO"
+    return rel_type
 
 def insert_to_dlq(user_id: str, workspace_id: str, event_type: str, payload: dict, error_message: str):
     """Inserts a failed task payload into the dead_letter_queue table."""
@@ -34,22 +46,25 @@ def insert_to_dlq(user_id: str, workspace_id: str, event_type: str, payload: dic
     except Exception as dlq_err:
         logger.error(f"[DLQ] Failed to write to dead_letter_queue table: {dlq_err}")
 
-def background_graph_ingest(memory_id: str, content: str, user_id: str, workspace_id: str):
+def background_graph_ingest(memory_id: str, content: str, user_id: str, workspace_id: str, precomputed_graph: dict = None):
     """Background task to extract entities/relations and update the Neo4j Graph with retry logic and DLQ fallback."""
     logger.info(f"Triggering entity extraction for memory: {memory_id}")
     
-    # 1. Extract Entities
-    try:
-        graph_data = extract_entities_and_relationships(content)
-    except Exception as e:
-        logger.error(f"[Graph Ingest] Extraction failed: {e}")
-        insert_to_dlq(user_id, workspace_id, "MEMORY_INGESTED", {
-            "memory_id": memory_id, "content": content
-        }, f"Extraction failed: {e}")
-        from memoryos.core import event_store
-        if event_store._is_replaying:
-            raise e
-        return
+    # 1. Extract Entities (skip if precomputed graph data is provided)
+    if precomputed_graph is not None:
+        graph_data = precomputed_graph
+    else:
+        try:
+            graph_data = extract_entities_and_relationships(content)
+        except Exception as e:
+            logger.error(f"[Graph Ingest] Extraction failed: {e}")
+            insert_to_dlq(user_id, workspace_id, "MEMORY_INGESTED", {
+                "memory_id": memory_id, "content": content
+            }, f"Extraction failed: {e}")
+            from memoryos.core import event_store
+            if event_store._is_replaying:
+                raise e
+            return
 
     # 2. Retry Ingestion Loop
     max_retries = 3
@@ -160,17 +175,9 @@ def _execute_graph_inserts(memory_id: str, user_id: str, workspace_id: str, grap
     
     timestamp_str = datetime.now(timezone.utc).isoformat()
     for rel in resolved_rels:
-        rel_type = rel["type"].upper().strip()
-        
-        # Cypher Injection validation
-        if not re.match(r"^[A-Z][A-Z0-9_]*$", rel_type):
-            logger.warning(f"[Graph Ingest] Discarding invalid relationship string: '{rel_type}' (Cypher injection block)")
+        rel_type = sanitize_relationship_type(rel["type"])
+        if not rel_type:
             continue
-            
-        # Allowed Enum mapping
-        if rel_type not in ALLOWED_RELATIONSHIPS:
-            logger.info(f"[Graph Ingest] Relationship '{rel_type}' not whitelisted. Mapping to RELATED_TO.")
-            rel_type = "RELATED_TO"
             
         rel_query = f"""
             MATCH (s:Entity {{name: $source, workspace_id: $workspace_id}})

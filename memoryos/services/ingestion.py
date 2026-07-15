@@ -39,6 +39,9 @@ class MemoryIngestionService:
             
         # 1. Pre-calculate all derived payloads for event logging (determinstic replay storage)
         clauses_payload = []
+        all_entities = []
+        all_relationships = []
+        
         for evt in events:
             importance = calculate_importance(evt)
             memory_type = classify_memory(evt)
@@ -49,22 +52,29 @@ class MemoryIngestionService:
                 logger.error(f"Embedding generation failed: {e}")
                 raise HTTPException(status_code=500, detail="Embedding model execution failed.")
             
+            # Extract clause-specific graph data once
+            clause_graph = extract_entities_and_relationships(evt)
+            clause_entities = clause_graph.get("entities", [])
+            clause_relationships = clause_graph.get("relationships", [])
+            
+            all_entities.extend(clause_entities)
+            all_relationships.extend(clause_relationships)
+            
             clauses_payload.append({
                 "content": evt,
                 "embedding": embedding,
                 "memory_type": memory_type,
-                "importance": importance
+                "importance": importance,
+                "entities": clause_entities,
+                "relationships": clause_relationships
             })
             
-        # Extract graph structures for the event store payload
-        graph_data = extract_entities_and_relationships(data.content)
-        
         event_payload = {
             "raw_text": data.content,
             "session_id": data.session_id,
             "clauses": clauses_payload,
-            "entities": graph_data.get("entities", []),
-            "relationships": graph_data.get("relationships", []),
+            "entities": all_entities,
+            "relationships": all_relationships,
             "metadata": {
                 "schema_version": "1.2",
                 "embedding_model": "all-MiniLM-L6-v2",
@@ -137,7 +147,8 @@ class MemoryIngestionService:
                         )
                     
                     target_memory_id = existing_memory_id if frequency_updated else evt_id
-                    ingested_memory_ids.append((target_memory_id, evt, embedding, memory_type, frequency_updated))
+                    clause_graph = {"entities": item["entities"], "relationships": item["relationships"]}
+                    ingested_memory_ids.append((target_memory_id, evt, embedding, memory_type, frequency_updated, clause_graph))
             
             conn.commit()
             conn.close()
@@ -148,14 +159,15 @@ class MemoryIngestionService:
             raise HTTPException(status_code=500, detail="Database write error.")
             
         # 3. Graph Ingestion
-        for target_memory_id, evt, embedding, memory_type, frequency_updated in ingested_memory_ids:
+        for target_memory_id, evt, embedding, memory_type, frequency_updated, precomputed_graph in ingested_memory_ids:
             if background_tasks:
                 background_tasks.add_task(
                     background_graph_ingest,
                     target_memory_id,
                     evt,
                     data.user_id,
-                    data.workspace_id
+                    data.workspace_id,
+                    precomputed_graph
                 )
             else:
                 # Synchronous graph ingestion (for CLI / tests / Replay context)
@@ -163,7 +175,8 @@ class MemoryIngestionService:
                     target_memory_id,
                     evt,
                     data.user_id,
-                    data.workspace_id
+                    data.workspace_id,
+                    precomputed_graph
                 )
                 
             stm_cache.push(data.user_id, data.workspace_id, target_memory_id, evt, embedding)
