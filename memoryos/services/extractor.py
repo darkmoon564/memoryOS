@@ -1,8 +1,12 @@
 import os
 import json
 import requests
-import spacy
 from memoryos.config import logger
+
+try:
+    import spacy
+except ImportError:
+    spacy = None
 
 nlp = None
 
@@ -16,6 +20,9 @@ def load_spacy_model():
     if nlp is not None:
         return nlp
         
+    if spacy is None:
+        logger.warning("spaCy is not installed. Offline extraction will use the regex parser.")
+        return None
     try:
         nlp = spacy.load("en_core_web_sm")
     except OSError:

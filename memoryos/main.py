@@ -1,6 +1,10 @@
 import threading
+import time
+import uuid
+import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 # Routers
 from memoryos.api.memories import router as memories_router
@@ -11,12 +15,32 @@ from memoryos.config import logger
 from memoryos.core.scorer import _execute_decay_logic
 from memoryos.core.reflection import start_reflection_daemon
 from memoryos.db.neo4j import get_neo4j_conn
+from memoryos.services.background import drain_graph_projections
+from memoryos.observability import metrics, request_id
+from memoryos.migrations import status as migration_status
+import memoryos.config as config
 
 _decay_timer = None
+_projection_timer = None
+
+
+def run_graph_projection_sweep():
+    """Recover graph projections that survived a request or process failure."""
+    global _projection_timer
+    try:
+        completed = drain_graph_projections()
+        if completed:
+            logger.info("[Scheduler] Completed %s pending graph projections.", completed)
+    except Exception:
+        logger.exception("[Scheduler] Graph projection sweep failed")
+    finally:
+        _projection_timer = threading.Timer(60, run_graph_projection_sweep)
+        _projection_timer.daemon = True
+        _projection_timer.start()
 
 def run_decay_sweep():
     """Background decay sweep that runs periodically."""
-    global _decay_timer
+    global _decay_timer, _projection_timer
     try:
         logger.info("[Scheduler] Running automatic decay sweep...")
         decayed = _execute_decay_logic()
@@ -38,6 +62,21 @@ async def lifespan(app: FastAPI):
     global _decay_timer
     logger.info("[Startup] Initializing Threaded Postgres Connection Pool...")
     init_postgres_pool()
+
+    if not config.allow_in_memory_fallback():
+        pending, changed = migration_status()
+        if changed:
+            raise RuntimeError(f"Applied migrations were modified: {', '.join(changed)}")
+        if pending:
+            raise RuntimeError(f"Database migrations are pending: {', '.join(pending)}. Run `python -m memoryos.migrations upgrade`.")
+
+    # Force graph verification before accepting requests. In-memory graph mode is
+    # only available when explicitly opted into for tests.
+    get_neo4j_conn()
+
+    if os.getenv("MEMORYOS_EMBEDDED_WORKER", "false").lower() == "true":
+        logger.warning("[Startup] Embedded graph worker enabled; use `python -m memoryos.worker` for production.")
+        run_graph_projection_sweep()
     
     logger.info("[Startup] Starting automatic decay scheduler (24h interval)...")
     _decay_timer = threading.Timer(60, run_decay_sweep)  # First run after 60s
@@ -56,6 +95,9 @@ async def lifespan(app: FastAPI):
     if _decay_timer:
         _decay_timer.cancel()
         logger.info("[Shutdown] Decay scheduler stopped.")
+    if _projection_timer:
+        _projection_timer.cancel()
+        logger.info("[Shutdown] Graph projection scheduler stopped.")
         
     logger.info("[Shutdown] Closing Threaded Postgres Connection Pool...")
     close_postgres_pool()
@@ -65,9 +107,35 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Memory Operating System (MemoryOS)", version="1.2.0", lifespan=lifespan)
 
+
+@app.middleware("http")
+async def observe_http_request(request: Request, call_next):
+    incoming_id = request.headers.get("X-Request-ID", "")
+    correlation_id = incoming_id if 0 < len(incoming_id) <= 128 else uuid.uuid4().hex
+    token = request_id.set(correlation_id)
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = correlation_id
+        return response
+    finally:
+        route = request.scope.get("route")
+        metric_path = getattr(route, "path", request.url.path)
+        metrics.increment("memoryos_http_requests_total", {"method": request.method, "path": metric_path, "status": status_code})
+        metrics.observe("memoryos_http_request_duration_seconds", time.perf_counter() - started, {"method": request.method, "path": metric_path})
+        request_id.reset(token)
+
 @app.get("/health")
 async def health_check():
-    """Detailed health check endpoint reporting status of PostgreSQL, Neo4j, and ML models."""
+    """Liveness probe. It deliberately does not depend on external services."""
+    return {"status": "ok", "version": "1.2.0"}
+
+
+@app.get("/readyz")
+async def readiness_check():
+    """Readiness probe for durable stores required to accept memory writes."""
     postgres_status = "connected"
     try:
         conn = get_postgres_conn()
@@ -87,35 +155,21 @@ async def health_check():
     except Exception:
         neo4j_status = "disconnected"
         
-    from memoryos.api.memories import get_embedding_model, get_reranker_model
-    emb_status = "loaded"
-    try:
-        get_embedding_model()
-    except Exception:
-        emb_status = "failed"
-        
-    reranker_status = "loaded"
-    try:
-        get_reranker_model()
-    except Exception:
-        reranker_status = "failed"
-        
-    overall_status = "healthy"
-    if postgres_status == "disconnected" or emb_status == "failed":
-        overall_status = "unhealthy"
-    elif neo4j_status in ["degraded", "disconnected"] or reranker_status == "failed":
-        overall_status = "degraded"
-        
-    return {
-        "status": overall_status,
+    ready = postgres_status == "connected" and neo4j_status == "connected"
+    body = {
+        "status": "ready" if ready else "not_ready",
         "version": "1.2.0",
         "dependencies": {
             "postgres": postgres_status,
             "neo4j": neo4j_status,
-            "embedding_model": emb_status,
-            "reranker_model": reranker_status
         }
     }
+    return JSONResponse(status_code=200 if ready else 503, content=body)
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics():
+    return PlainTextResponse(metrics.render_prometheus(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 # Register routes
 app.include_router(memories_router)

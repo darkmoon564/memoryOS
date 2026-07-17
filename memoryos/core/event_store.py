@@ -13,15 +13,17 @@ from memoryos.services.background import insert_to_dlq
 
 _is_replaying = False
 
-def log_event(user_id: str, workspace_id: str, event_type: str, payload: dict):
-    """Logs a state mutation event to the event_store table."""
+def log_event(user_id: str, workspace_id: str, event_type: str, payload: dict, conn=None):
+    """Log a mutation event, optionally in the caller's database transaction."""
     global _is_replaying
     if _is_replaying:
         return
     
     event_id = str(uuid.uuid4())
+    owns_connection = conn is None
     try:
-        conn = get_postgres_conn()
+        if owns_connection:
+            conn = get_postgres_conn()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -30,10 +32,16 @@ def log_event(user_id: str, workspace_id: str, event_type: str, payload: dict):
                 """,
                 (event_id, user_id, workspace_id, event_type, json.dumps(payload))
             )
-        conn.commit()
-        conn.close()
+        if owns_connection:
+            conn.commit()
     except Exception as e:
+        if owns_connection and conn:
+            conn.rollback()
         logger.error(f"[EventStore] Failed to log event: {e}")
+        raise
+    finally:
+        if owns_connection and conn:
+            conn.close()
 
 # ──────────────────────────────────────────────────────────────────────
 # Background Job Helpers
@@ -122,8 +130,9 @@ def restore_precomputed_clauses(user_id: str, session_id: Optional[str], workspa
     conn.close()
 
 # ──────────────────────────────────────────────────────────────────────
-def execute_workflow_ingest(user_id: str, workspace_id: str, name: str, description: Optional[str], steps: list):
+def execute_workflow_ingest(user_id: str, workspace_id: str, name: str, description: Optional[str], steps: list) -> str:
     """Saves workflow procedural step data in postgres/neo4j directly without HTTP route endpoints."""
+    workflow_id = str(uuid.uuid4())
     conn = get_postgres_conn()
     with conn.cursor() as cur:
         cur.execute(
@@ -131,7 +140,7 @@ def execute_workflow_ingest(user_id: str, workspace_id: str, name: str, descript
             INSERT INTO workflows (id, user_id, workspace_id, name, description, steps)
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
-            (str(uuid.uuid4()), user_id, workspace_id, name, description, json.dumps(steps))
+            (workflow_id, user_id, workspace_id, name, description, json.dumps(steps))
         )
     conn.commit()
     conn.close()
@@ -198,6 +207,7 @@ def execute_workflow_ingest(user_id: str, workspace_id: str, name: str, descript
                     """,
                     {"tech": tech, "name": name, "workspace_id": workspace_id}
                 )
+    return workflow_id
 
 # ──────────────────────────────────────────────────────────────────────
 # Replay vs Rebuild Workers

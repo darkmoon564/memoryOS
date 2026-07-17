@@ -15,6 +15,7 @@ dist/
 # Environment / Local Secrets
 .env
 .env.*
+!.env.example
 
 # Logs
 *.log

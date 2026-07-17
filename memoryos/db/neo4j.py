@@ -486,8 +486,10 @@ class Neo4jConnector:
             self.is_mock = False
             config._use_neo4j_fallback = False
         except Exception as e:
+            if not config.allow_in_memory_fallback():
+                raise RuntimeError("Neo4j is unavailable; refusing non-durable fallback.") from e
             if config._use_neo4j_fallback is None:
-                logger.warning("Neo4j database connection timed out or failed. Graph features operating in Mock mode.")
+                logger.warning("Neo4j connection failed. Using explicitly enabled in-memory adapter.")
             self._driver = MockNeo4jDriver()
             self.is_mock = True
             config._use_neo4j_fallback = True
@@ -509,9 +511,9 @@ def get_neo4j_conn():
     if _neo4j_conn is None:
         try:
             _neo4j_conn = Neo4jConnector()
-        except Exception as e:
-            logger.error(f"Failed to connect to Neo4j: {e}. Graph features will run in mock mode.")
-            _neo4j_conn = None
+        except Exception:
+            # Let startup and API callers surface an actionable dependency error.
+            raise
     return _neo4j_conn
 
 def close_neo4j_conn():

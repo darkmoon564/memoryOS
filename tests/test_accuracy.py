@@ -229,4 +229,6 @@ async def evaluate_accuracy():
     print("=" * 70)
 
 if __name__ == "__main__":
-    asyncio.run(evaluate_accuracy())
+    from unittest.mock import patch
+    with patch("memoryos.api.memories.verify_workspace_key", return_value=None):
+        asyncio.run(evaluate_accuracy())

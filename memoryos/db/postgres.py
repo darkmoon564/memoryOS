@@ -215,6 +215,9 @@ class MockPostgresConnection:
     def commit(self):
         self.sqlite_conn.commit()
 
+    def rollback(self):
+        self.sqlite_conn.rollback()
+
     def close(self):
         pass
 
@@ -242,8 +245,11 @@ def init_postgres_pool():
         )
         logger.info("[Database] Threaded Postgres Connection Pool initialized successfully.")
     except Exception as e:
-        logger.error(f"[Database] Failed to initialize Threaded Connection Pool: {e}. Operating with fallback mode.")
-        config._use_postgres_fallback = True
+        if config.allow_in_memory_fallback():
+            logger.warning(f"[Database] Failed to initialize connection pool: {e}. Using explicitly enabled in-memory adapter.")
+            config._use_postgres_fallback = True
+            return
+        raise RuntimeError("PostgreSQL connection pool initialization failed; refusing non-durable fallback.") from e
 
 def close_postgres_pool():
     global _postgres_pool
@@ -279,7 +285,7 @@ class PooledConnectionWrapper:
         self.close()
 
 def get_postgres_conn():
-    """Establishes connection to PostgreSQL or falls back to Mock SQLite connection."""
+    """Return a durable PostgreSQL connection, or an explicitly enabled test adapter."""
     import memoryos.config as config
     if config._use_postgres_fallback:
         return MockPostgresConnection()
@@ -307,7 +313,9 @@ def get_postgres_conn():
         config._use_postgres_fallback = False
         return conn
     except Exception as e:
-        if config._use_postgres_fallback is None:
-            logger.warning("PostgreSQL connection timed out or failed. Falling back to local in-memory Mock DB mode.")
-        config._use_postgres_fallback = True
-        return MockPostgresConnection()
+        if config.allow_in_memory_fallback():
+            if config._use_postgres_fallback is None:
+                logger.warning("PostgreSQL connection failed. Using explicitly enabled in-memory adapter.")
+            config._use_postgres_fallback = True
+            return MockPostgresConnection()
+        raise RuntimeError("PostgreSQL is unavailable; refusing non-durable fallback.") from e

@@ -32,7 +32,7 @@ pip install -r requirements.txt
 ```
 
 ### 2. Configure Environment Variables
-Create a `.env` file in the root directory:
+Copy `.env.example` to `.env` and replace every placeholder with a unique local secret. Do not use the example values outside local development.
 ```env
 # Database Settings
 POSTGRES_HOST=localhost
@@ -59,16 +59,40 @@ OLLAMA_MODEL=llama3.2
 # Timeout for LLM calls in seconds (default: 15)
 LLM_TIMEOUT=15
 ```
-*Note: If no LLM is available, MemoryOS automatically falls back to a local **spaCy dependency parser** for entity extraction. If Postgres or Neo4j are not running, it uses an in-memory SQLite and mock graph database.*
+*Note: If no LLM is available, MemoryOS falls back to a local **spaCy dependency parser** for entity extraction. PostgreSQL and Neo4j are required for a durable deployment; the in-memory adapters are test-only and must be explicitly enabled.*
 
 ### 3. Launch the Server
 ```bash
 uvicorn memoryos.main:app --host 127.0.0.1 --port 8088
 ```
 
+For the complete local deployment, including a migration job and durable graph worker, run `docker compose up --build`. The API is available only on `127.0.0.1:8088` by default. The migration job must complete before the API or worker starts.
+
+The Compose environment intentionally uses deterministic offline models for fast, repeatable integration testing. Build the full semantic-model image for production with `docker build --build-arg INSTALL_ML=true -t memoryos:full .`.
+
+### Upgrading from a plaintext API-key database
+
+MemoryOS uses tracked, forward-only migrations. For a new database run `python -m memoryos.migrations bootstrap`; for an existing database, back it up and run `python -m memoryos.migrations upgrade`. Use `python -m memoryos.migrations status` in deployment checks. `0001` replaces stored plaintext keys with SHA-256 lookup hashes; `0002` adds the durable graph-projection queue. Callers continue sending the original API key in the Bearer header.
+
+Create an initial workspace key after startup. The command prints the secret once and stores only its hash:
+
+```bash
+python -m memoryos.manage create-api-key production_workspace --description "initial deployment key"
+```
+
+Run durable graph recovery as a separate process in production:
+
+```bash
+python -m memoryos.worker --interval 5 --batch-size 100
+```
+
+The API only writes durable outbox work in production. For local development without a worker, set `MEMORYOS_PROCESS_OUTBOX_INLINE=true`; `MEMORYOS_EMBEDDED_WORKER=true` additionally enables periodic in-process recovery. Production deployments should run one or more dedicated workers.
+
 ---
 
 ## 📡 API Endpoints
+
+`GET /health` is a liveness probe. `GET /readyz` verifies PostgreSQL and Neo4j before traffic is accepted. `GET /metrics` exposes Prometheus-compatible service metrics. Every HTTP response includes an `X-Request-ID` correlation header; send one to retain an upstream trace ID.
 
 ### Ingest Memory
 `POST /v1/memories`
@@ -110,6 +134,8 @@ python tests/test_accuracy.py
 # Synthetic multi-session dialogue evaluation
 python tests/synthetic_multisession_eval.py
 ```
+
+The CI suite also runs `python tests/test_durable_recovery.py` against real PostgreSQL and Neo4j. It verifies workspace-key isolation, recovery of committed-but-unprojected graph work, bounded retries, and dead-letter handling.
 
 ---
 

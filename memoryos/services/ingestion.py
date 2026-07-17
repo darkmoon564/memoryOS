@@ -1,6 +1,7 @@
 import uuid
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import BackgroundTasks, HTTPException
@@ -11,11 +12,13 @@ from memoryos.core.event_parser import parse_events
 from memoryos.core.classifier import classify_memory
 from memoryos.core.scorer import calculate_importance
 from memoryos.services.extractor import extract_entities_and_relationships
-from memoryos.services.background import background_graph_ingest
+from memoryos.services.background import process_graph_projection
 from memoryos.db.postgres import get_postgres_conn
 from memoryos.core.event_store import log_event
 from memoryos.core.cache import stm_cache
-from memoryos.api.memories import get_embedding_model, process_conversation_log
+from memoryos.models.embeddings import get_embedding_model
+from memoryos.core.episodes import process_conversation_log
+from memoryos.observability import metrics
 
 class MemoryIngestionService:
     """Centralized service managing validation, classification, SQL/Graph ingestion, and event logging."""
@@ -82,11 +85,9 @@ class MemoryIngestionService:
             }
         }
         
-        # Log event with full computed payload
-        log_event(data.user_id, data.workspace_id, "MEMORY_INGESTED", event_payload)
-        
-        # 2. Persist to PostgreSQL
+        # 2. Persist memory records and their event atomically.
         ingested_memory_ids = []
+        conn = None
         try:
             conn = get_postgres_conn()
             with conn.cursor() as cur:
@@ -148,36 +149,47 @@ class MemoryIngestionService:
                     
                     target_memory_id = existing_memory_id if frequency_updated else evt_id
                     clause_graph = {"entities": item["entities"], "relationships": item["relationships"]}
-                    ingested_memory_ids.append((target_memory_id, evt, embedding, memory_type, frequency_updated, clause_graph))
+                    projection_id = str(uuid.uuid4())
+                    cur.execute(
+                        """
+                        INSERT INTO graph_projection_outbox
+                            (id, memory_id, user_id, workspace_id, content, graph_payload)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (projection_id, target_memory_id, data.user_id, data.workspace_id, evt, json.dumps(clause_graph)),
+                    )
+                    ingested_memory_ids.append((target_memory_id, evt, embedding, memory_type, frequency_updated, projection_id))
+
+                # The event becomes visible only with the records it describes.
+                log_event(data.user_id, data.workspace_id, "MEMORY_INGESTED", event_payload, conn=conn)
             
             conn.commit()
-            conn.close()
         except HTTPException as he:
+            if conn:
+                conn.rollback()
+            metrics.increment("memoryos_memory_ingestions_total", {"outcome": "rejected"})
             raise he
         except Exception as e:
+            if conn:
+                conn.rollback()
             logger.error(f"Postgres write failed: {e}")
+            metrics.increment("memoryos_memory_ingestions_total", {"outcome": "failed"})
             raise HTTPException(status_code=500, detail="Database write error.")
+        finally:
+            if conn:
+                conn.close()
             
         # 3. Graph Ingestion
-        for target_memory_id, evt, embedding, memory_type, frequency_updated, precomputed_graph in ingested_memory_ids:
-            if background_tasks:
+        process_in_api = os.getenv("MEMORYOS_PROCESS_OUTBOX_INLINE", "false").lower() == "true"
+        for target_memory_id, evt, embedding, memory_type, frequency_updated, projection_id in ingested_memory_ids:
+            if process_in_api and background_tasks:
                 background_tasks.add_task(
-                    background_graph_ingest,
-                    target_memory_id,
-                    evt,
-                    data.user_id,
-                    data.workspace_id,
-                    precomputed_graph
+                    process_graph_projection,
+                    projection_id,
                 )
-            else:
-                # Synchronous graph ingestion (for CLI / tests / Replay context)
-                background_graph_ingest(
-                    target_memory_id,
-                    evt,
-                    data.user_id,
-                    data.workspace_id,
-                    precomputed_graph
-                )
+            elif process_in_api:
+                # CLI and replay callers synchronously drain the durable item.
+                process_graph_projection(projection_id)
                 
             stm_cache.push(data.user_id, data.workspace_id, target_memory_id, evt, embedding)
             
@@ -191,6 +203,8 @@ class MemoryIngestionService:
             f"Primary memory ({first_type}) {'updated' if is_updated else 'ingested'} and queued for indexing."
         )
         
+        metrics.increment("memoryos_memory_ingestions_total", {"outcome": "success"})
+        metrics.increment("memoryos_memory_events_total", amount=count)
         return IngestResponse(
             status="success",
             memory_id=first_id,

@@ -122,4 +122,6 @@ def test_retrieval_pipeline():
     print("=" * 60)
 
 if __name__ == "__main__":
-    test_retrieval_pipeline()
+    from unittest.mock import patch
+    with patch("memoryos.api.memories.verify_workspace_key", return_value=None):
+        test_retrieval_pipeline()

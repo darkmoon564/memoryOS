@@ -21,13 +21,14 @@ from memoryos.api.memories import (
     get_job_status
 )
 from memoryos.services.background import background_graph_ingest
+from memoryos.security import hash_api_key
 
 def seed_api_key(key: str, workspace_id: str):
     conn = get_postgres_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO api_keys (key, workspace_id, description) VALUES (%s, %s, %s) ON CONFLICT (key) DO NOTHING",
-            (key, workspace_id, "Test API Key")
+            "INSERT INTO api_keys (key_hash, workspace_id, description) VALUES (%s, %s, %s) ON CONFLICT (key_hash) DO NOTHING",
+            (hash_api_key(key), workspace_id, "Test API Key")
         )
     conn.commit()
     conn.close()
@@ -36,8 +37,8 @@ def cleanup_api_keys():
     conn = get_postgres_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "DELETE FROM api_keys WHERE key IN (%s, %s)",
-            ("key_default", "key_api_test")
+            "DELETE FROM api_keys WHERE key_hash IN (%s, %s)",
+            (hash_api_key("key_default"), hash_api_key("key_api_test"))
         )
     conn.commit()
     conn.close()
