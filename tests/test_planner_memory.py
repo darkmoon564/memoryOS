@@ -10,6 +10,29 @@ from memoryos.db.postgres import get_postgres_conn
 from memoryos.api.memories import retrieve_context
 from memoryos.schemas.memory import MemoryRetrieve
 
+
+class FixedEmbeddingModel:
+    """Stable non-zero embedding for exercising pgvector cosine retrieval."""
+
+    vector = [1.0] + [0.0] * 383
+
+    def encode(self, sentences):
+        if isinstance(sentences, str):
+            return list(self.vector)
+        return [list(self.vector) for _ in sentences]
+
+
+class EqualScoreReranker:
+    """Keeps goal boosts, rather than model weights, responsible for ranking."""
+
+    def predict(self, pairs):
+        return [1.0] * len(pairs)
+
+
+def result_for_content(results, content):
+    return next(result for result in results if result.content == content)
+
+
 def test_planner_memory_system():
     print("============================================================")
     print("  MemoryOS v1.2.0 - Planner Memory & Goal-Aware Tests")
@@ -37,7 +60,10 @@ def test_planner_memory_system():
     import uuid
     import json
     
-    dummy_emb = [0.0] * 384
+    # Zero vectors are deliberately excluded from pgvector cosine HNSW indexes.
+    # Use a deterministic unit vector so this test covers the real retrieval
+    # query rather than an index edge case.
+    dummy_emb = FixedEmbeddingModel.vector
     emb_str = json.dumps(dummy_emb)
     now = datetime.now(timezone.utc)
     
@@ -83,10 +109,14 @@ def test_planner_memory_system():
     print(f"  Detected Goal Category: {res_dev.goal_category}")
     assert res_dev.goal_category == "DEVELOPER"
     
-    # Verify Developer memory is boosted/first
+    # Verify the developer memory receives a stronger goal boost than an
+    # unrelated shopping preference. Do not assert an arbitrary order between
+    # multiple developer-related memories.
     results_dev = res_dev.results
     print(f"  Results ordered: {[r.content for r in results_dev]}")
-    assert results_dev[0].content == "User prefers coding in Python."
+    assert result_for_content(results_dev, "User prefers coding in Python.").score > result_for_content(
+        results_dev, "User has a budget of 50 USD for tools."
+    ).score
     
     # Test 4: Retrieve with Shopping Goal
     print("\nStep 3: Retrieving context with SHOPPING goal...")
@@ -104,7 +134,9 @@ def test_planner_memory_system():
     
     results_shop = res_shop.results
     print(f"  Results ordered: {[r.content for r in results_shop]}")
-    assert results_shop[0].content == "User has a budget of 50 USD for tools."
+    assert result_for_content(results_shop, "User has a budget of 50 USD for tools.").score > result_for_content(
+        results_shop, "User prefers coding in Python."
+    ).score
     
     # Test 5: Retrieve with Research Goal
     print("\nStep 4: Retrieving context with RESEARCH goal...")
@@ -122,8 +154,10 @@ def test_planner_memory_system():
     
     results_research = res_research.results
     print(f"  Results ordered: {[r.content for r in results_research]}")
-    # Verify that the Factual memory is boosted
-    assert any(r.content == "Factual info: Rust is a systems programming language." for r in results_research)
+    # Verify that the factual memory is boosted over a preference.
+    assert result_for_content(
+        results_research, "Factual info: Rust is a systems programming language."
+    ).score > result_for_content(results_research, "User prefers coding in Python.").score
     
     conn.close()
     print("\n" + "=" * 60)
@@ -132,5 +166,9 @@ def test_planner_memory_system():
 
 if __name__ == "__main__":
     from unittest.mock import patch
-    with patch("memoryos.api.memories.verify_workspace_key", return_value=None):
+    with (
+        patch("memoryos.api.memories.verify_workspace_key", return_value=None),
+        patch("memoryos.api.memories.get_embedding_model", return_value=FixedEmbeddingModel()),
+        patch("memoryos.api.memories.get_reranker_model", return_value=EqualScoreReranker()),
+    ):
         test_planner_memory_system()
