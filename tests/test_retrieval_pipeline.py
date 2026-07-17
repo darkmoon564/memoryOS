@@ -1,4 +1,5 @@
 import os
+os.environ["MEMORYOS_PROCESS_OUTBOX_INLINE"] = "true"
 import sys
 
 # Ensure package is in path if run directly

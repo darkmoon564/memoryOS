@@ -157,7 +157,15 @@ def format_context_markdown(results: list, temporal_range: tuple = None, working
 
 def background_access_updates(memory_ids: List[str]):
     """Increment access counts and refresh accessed timestamp."""
-    if not memory_ids:
+    valid_memory_ids = []
+    for memory_id in memory_ids:
+        try:
+            valid_memory_ids.append(str(uuid.UUID(str(memory_id))))
+        except (ValueError, TypeError, AttributeError):
+            # Graph and workflow result IDs are intentionally synthetic and
+            # must never be sent to PostgreSQL's uuid[] cast.
+            continue
+    if not valid_memory_ids:
         return
     try:
         conn = get_postgres_conn()
@@ -169,7 +177,7 @@ def background_access_updates(memory_ids: List[str]):
                     last_accessed_at = CURRENT_TIMESTAMP
                 WHERE id = ANY(%s::uuid[])
                 """,
-                (memory_ids,)
+                (valid_memory_ids,)
             )
         conn.commit()
         conn.close()
@@ -620,9 +628,18 @@ async def retrieve_context(
                         "memory_type": "FACTUAL"
                     }
                     m_scores = compile_multidimensional_scores(wf_item_info, 0.99, "system")
+                    steps = row['steps']
+                    if isinstance(steps, str):
+                        try:
+                            parsed_steps = json.loads(steps)
+                            steps = parsed_steps if isinstance(parsed_steps, list) else [parsed_steps]
+                        except (TypeError, ValueError):
+                            steps = [steps]
+                    else:
+                        steps = list(steps or [])
                     procedural_items.append({
                         "memory_id": f"workflow_{row['id']}",
-                        "content": row['steps'],
+                        "content": json.dumps(steps, ensure_ascii=False),
                         "name": row['name'],
                         "description": row['description'],
                         "score": 0.99,

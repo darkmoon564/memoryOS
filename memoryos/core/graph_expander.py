@@ -26,7 +26,7 @@ def expand_entities(neo4j, user_id: str, workspace_id: str, entities: list) -> d
             "     MATCH (a:Alias)-[:ALIAS_OF]->(e) "
             "     WHERE toLower(a.name) IN $entities_lower "
             "   } "
-            "MATCH p=(e)-[r:KNOWS_ABOUT|LEARNING_TOPIC|BELONGS_TO_TOPIC|HAS_PROFILE|BELONGS_TO_PROFILE|HAS_WORKFLOW|USES_TECH*1..3]->(target:Entity) "
+            "MATCH p=(e)-[r:WORKS_AT|LIVES_IN|INTERESTED_IN|USES|KNOWS|RELATED_TO|OWNS|KNOWS_ABOUT|LEARNING_TOPIC|BELONGS_TO_TOPIC|HAS_PROFILE|BELONGS_TO_PROFILE|HAS_WORKFLOW|USES_TECH*1..3]->(target:Entity) "
             "WHERE all(rel IN relationships(p) WHERE coalesce(rel.is_active, true) = true) "
             "UNWIND relationships(p) AS rel "
             "RETURN startNode(rel).name AS source, type(rel) AS rel, endNode(rel).name AS target"
