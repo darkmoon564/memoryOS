@@ -45,13 +45,16 @@ def test_contradiction_engine():
         assert r.get("valid_from") is not None, "Expected valid_from to be set"
         assert r.get("valid_to") is None, "Expected valid_to to be None"
     else:
-        res = neo4j.query("MATCH (:Entity)-[r:LIVES_IN]->(:Entity) RETURN r")
+        res = neo4j.query(
+            "MATCH (:Entity)-[r:LIVES_IN]->(:Entity) "
+            "RETURN r.is_active AS is_active, r.valid_from AS valid_from, r.valid_to AS valid_to"
+        )
         assert len(res) == 1, "Expected 1 LIVES_IN relationship in Neo4j"
-        r = res[0]["r"]
-        print(f"  Initial relation: is_active={r['is_active']}, valid_from={r.get('valid_from')}, valid_to={r.get('valid_to')}")
-        assert r["is_active"] is True
-        assert r.get("valid_from") is not None
-        assert r.get("valid_to") is None
+        row = res[0]
+        print(f"  Initial relation: is_active={row['is_active']}, valid_from={row['valid_from']}, valid_to={row['valid_to']}")
+        assert row["is_active"] is True
+        assert row["valid_from"] is not None
+        assert row["valid_to"] is None
         
     # 3. Ingest contradicting fact: "Alice lives in Berlin."
     print("\nStep 2: Ingesting contradicting fact 'Alice lives in Berlin.'...")
@@ -94,35 +97,45 @@ def test_contradiction_engine():
     else:
         # Real Neo4j verification
         # Fetch old deactivated relationship
-        res_old = neo4j.query("MATCH (s:Entity)-[r:LIVES_IN]->(t:Entity {name: 'austin'}) RETURN r")
-        r_old = res_old[0]["r"]
+        res_old = neo4j.query(
+            "MATCH (s:Entity)-[r:LIVES_IN]->(t:Entity {name: 'austin'}) "
+            "RETURN r.is_active AS is_active, r.valid_from AS valid_from, "
+            "r.valid_to AS valid_to, r.superseded_by AS superseded_by"
+        )
+        r_old = res_old[0]
         print("\n  Verifying Old Fact (Austin):")
-        print(f"    is_active={r_old['is_active']}, valid_from={r_old.get('valid_from')}, valid_to={r_old.get('valid_to')}, superseded_by={r_old.get('superseded_by')}")
+        print(f"    is_active={r_old['is_active']}, valid_from={r_old['valid_from']}, valid_to={r_old['valid_to']}, superseded_by={r_old['superseded_by']}")
         assert r_old["is_active"] is False
-        assert r_old.get("valid_to") is not None
-        assert r_old.get("superseded_by") == "berlin"
+        assert r_old["valid_to"] is not None
+        assert r_old["superseded_by"] == "berlin"
         
         # Fetch new active relationship
-        res_new = neo4j.query("MATCH (s:Entity)-[r:LIVES_IN]->(t:Entity {name: 'berlin'}) RETURN r")
-        r_new = res_new[0]["r"]
+        res_new = neo4j.query(
+            "MATCH (s:Entity)-[r:LIVES_IN]->(t:Entity {name: 'berlin'}) "
+            "RETURN r.is_active AS is_active, r.valid_from AS valid_from, r.valid_to AS valid_to"
+        )
+        r_new = res_new[0]
         print("\n  Verifying New Fact (Berlin):")
-        print(f"    is_active={r_new['is_active']}, valid_from={r_new.get('valid_from')}, valid_to={r_new.get('valid_to')}")
+        print(f"    is_active={r_new['is_active']}, valid_from={r_new['valid_from']}, valid_to={r_new['valid_to']}")
         assert r_new["is_active"] is True
-        assert r_new.get("valid_from") is not None
-        assert r_new.get("valid_to") is None
+        assert r_new["valid_from"] is not None
+        assert r_new["valid_to"] is None
         
         # Fetch SUPERSEDED_BY edge
-        res_ss = neo4j.query("MATCH (old)-[r:SUPERSEDED_BY]->(new) RETURN old.name AS source, new.name AS target, r")
+        res_ss = neo4j.query(
+            "MATCH (old)-[r:SUPERSEDED_BY]->(new) "
+            "RETURN old.name AS source, new.name AS target, "
+            "r.relationship_type AS relationship_type, r.subject AS subject, r.timestamp AS timestamp"
+        )
         assert len(res_ss) == 1
         ss_row = res_ss[0]
-        ss = ss_row["r"]
         print("\n  Verifying SUPERSEDED_BY edge:")
-        print(f"    source={ss_row['source']}, target={ss_row['target']}, relationship_type={ss.get('relationship_type')}, subject={ss.get('subject')}, timestamp={ss.get('timestamp')}")
+        print(f"    source={ss_row['source']}, target={ss_row['target']}, relationship_type={ss_row['relationship_type']}, subject={ss_row['subject']}, timestamp={ss_row['timestamp']}")
         assert ss_row["source"] == "austin"
         assert ss_row["target"] == "berlin"
-        assert ss.get("relationship_type") == "LIVES_IN"
-        assert ss.get("subject") == "alice"
-        assert ss.get("timestamp") is not None
+        assert ss_row["relationship_type"] == "LIVES_IN"
+        assert ss_row["subject"] == "alice"
+        assert ss_row["timestamp"] is not None
         
     print("\n" + "=" * 60)
     print("  Contradiction Engine tests completed successfully!")
