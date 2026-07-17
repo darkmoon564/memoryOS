@@ -2,19 +2,25 @@ import re
 import time
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from psycopg2.extras import RealDictCursor
 from memoryos.config import logger
 from memoryos.db.neo4j import get_neo4j_conn
 from memoryos.services.extractor import extract_entities_and_relationships
 from memoryos.core.contradiction import resolve_contradictions
 from memoryos.core.entity_resolver import resolve_entity
+from memoryos.db.postgres import get_postgres_conn
+from memoryos.observability import metrics
 
 ALLOWED_RELATIONSHIPS = {
     "WORKS_AT", "LIVES_IN", "INTERESTED_IN", "USES", "KNOWS", "OWNS",
     "LEARNING_TOPIC", "BELONGS_TO_TOPIC", "HAS_PROFILE", "BELONGS_TO_PROFILE",
     "HAS_WORKFLOW", "USES_TECH", "KNOWS_ABOUT", "SUPERSEDED_BY"
 }
+MAX_GRAPH_PROJECTION_ATTEMPTS = 10
+GRAPH_PROJECTION_LEASE_SECONDS = 300
+GRAPH_PROJECTION_MAX_BACKOFF_SECONDS = 300
 
 def sanitize_relationship_type(rel_type: str) -> Optional[str]:
     """Validates the relationship type string for Cypher safety and whitelists."""
@@ -32,7 +38,7 @@ def insert_to_dlq(user_id: str, workspace_id: str, event_type: str, payload: dic
     try:
         from memoryos.db.postgres import get_postgres_conn
         conn = get_postgres_conn()
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
                 INSERT INTO dead_letter_queue (id, user_id, workspace_id, event_type, payload, error_message)
@@ -43,6 +49,7 @@ def insert_to_dlq(user_id: str, workspace_id: str, event_type: str, payload: dic
         conn.commit()
         conn.close()
         logger.info(f"[DLQ] Logged failed job to dead_letter_queue table.")
+        metrics.increment("memoryos_dead_letter_events_total")
     except Exception as dlq_err:
         logger.error(f"[DLQ] Failed to write to dead_letter_queue table: {dlq_err}")
 
@@ -64,7 +71,7 @@ def background_graph_ingest(memory_id: str, content: str, user_id: str, workspac
             from memoryos.core import event_store
             if event_store._is_replaying:
                 raise e
-            return
+            return False
 
     # 2. Retry Ingestion Loop
     max_retries = 3
@@ -73,7 +80,7 @@ def background_graph_ingest(memory_id: str, content: str, user_id: str, workspac
     for attempt in range(1, max_retries + 1):
         try:
             _execute_graph_inserts(memory_id, user_id, workspace_id, graph_data)
-            return  # Success
+            return True
         except Exception as e:
             logger.warning(f"[Graph Ingest] Insertion attempt {attempt}/{max_retries} failed: {e}")
             if attempt < max_retries:
@@ -87,6 +94,123 @@ def background_graph_ingest(memory_id: str, content: str, user_id: str, workspac
                 from memoryos.core import event_store
                 if event_store._is_replaying:
                     raise e
+                return False
+
+
+def process_graph_projection(projection_id: str) -> bool:
+    """Atomically claim and project one durable graph-outbox row."""
+    conn = get_postgres_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # RETURNING makes the claim single-consumer even when multiple API
+            # workers wake up at the same time.
+            cur.execute(
+                """
+                UPDATE graph_projection_outbox
+                SET status = 'PROCESSING', attempts = attempts + 1, error_message = NULL,
+                    locked_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND (
+                    (status IN ('PENDING', 'RETRY') AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP))
+                    OR (status = 'PROCESSING' AND locked_at < %s)
+                )
+                RETURNING memory_id, user_id, workspace_id, content, graph_payload, attempts
+                """,
+                (projection_id, datetime.now(timezone.utc) - timedelta(seconds=GRAPH_PROJECTION_LEASE_SECONDS)),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return False
+
+        row_data = dict(row)
+        payload = row_data["graph_payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        try:
+            _execute_graph_inserts(
+                str(row_data["memory_id"]),
+                row_data["user_id"],
+                row_data["workspace_id"],
+                payload,
+            )
+        except Exception as exc:
+            error_message = str(exc)
+            if row_data["attempts"] >= MAX_GRAPH_PROJECTION_ATTEMPTS:
+                _finish_graph_projection(projection_id, "FAILED", error_message)
+                insert_to_dlq(
+                    row_data["user_id"],
+                    row_data["workspace_id"],
+                    "GRAPH_PROJECTION_FAILED",
+                    {"projection_id": projection_id, "memory_id": str(row_data["memory_id"]), "graph_payload": payload},
+                    error_message,
+                )
+                logger.exception("[Graph Outbox] Projection %s exhausted retries and moved to DLQ", projection_id)
+                metrics.increment("memoryos_graph_projections_total", {"outcome": "failed"})
+            else:
+                retry_delay = min(GRAPH_PROJECTION_MAX_BACKOFF_SECONDS, 2 ** row_data["attempts"])
+                _finish_graph_projection(
+                    projection_id,
+                    "RETRY",
+                    error_message,
+                    next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=retry_delay),
+                )
+                logger.exception("[Graph Outbox] Projection %s failed and will be retried", projection_id)
+                metrics.increment("memoryos_graph_projections_total", {"outcome": "retry"})
+            return False
+
+        _finish_graph_projection(projection_id, "COMPLETED")
+        metrics.increment("memoryos_graph_projections_total", {"outcome": "completed"})
+        return True
+    finally:
+        conn.close()
+
+
+def _finish_graph_projection(projection_id: str, status: str, error_message: str | None = None, next_attempt_at=None) -> None:
+    conn = get_postgres_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE graph_projection_outbox
+                SET status = %s, error_message = %s,
+                    completed_at = CASE WHEN %s = 'COMPLETED' THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    next_attempt_at = %s,
+                    locked_at = NULL
+                WHERE id = %s
+                """,
+                (status, error_message, status, next_attempt_at, projection_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def drain_graph_projections(limit: int = 100) -> int:
+    """Recover queued graph work after startup and on the periodic worker tick."""
+    conn = get_postgres_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM graph_projection_outbox
+                WHERE (status IN ('PENDING', 'RETRY') AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP))
+                   OR (status = 'PROCESSING' AND locked_at < %s)
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                (datetime.now(timezone.utc) - timedelta(seconds=GRAPH_PROJECTION_LEASE_SECONDS), limit),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    completed = 0
+    for row in rows:
+        projection_id = row["id"] if isinstance(row, dict) else row[0]
+        if process_graph_projection(str(projection_id)):
+            completed += 1
+    return completed
 
 def _execute_graph_inserts(memory_id: str, user_id: str, workspace_id: str, graph_data: dict):
     """Executes the raw Cypher query database modifications on Neo4j."""

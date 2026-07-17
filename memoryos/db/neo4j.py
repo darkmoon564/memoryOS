@@ -1,6 +1,35 @@
 import os
 from neo4j import GraphDatabase
 from memoryos.config import logger, _mock_graph_data
+from collections.abc import Mapping
+
+
+def _normalize_neo4j_value(value):
+    """Convert Neo4j graph values into stable, JSON-like Python values."""
+    if isinstance(value, Mapping):
+        return {key: _normalize_neo4j_value(item) for key, item in value.items()}
+    if hasattr(value, "keys") and hasattr(value, "__getitem__"):
+        try:
+            return {key: _normalize_neo4j_value(value[key]) for key in value.keys()}
+        except (KeyError, TypeError, AttributeError):
+            pass
+    if isinstance(value, (list, tuple)):
+        return type(value)(_normalize_neo4j_value(item) for item in value)
+    return value
+
+
+def _normalize_neo4j_record(record, keys=()):
+    """Return a query row as a mapping regardless of driver record shape."""
+    if hasattr(record, "data"):
+        try:
+            record = record.data()
+        except (TypeError, AttributeError):
+            pass
+    if isinstance(record, Mapping):
+        return {key: _normalize_neo4j_value(value) for key, value in record.items()}
+    if keys and isinstance(record, (list, tuple)):
+        return {key: _normalize_neo4j_value(value) for key, value in zip(keys, record)}
+    return record
 
 class MockNeo4jDriver:
     """Mock Neo4j graph driver storing relationships in memory."""
@@ -435,6 +464,63 @@ class MockNeo4jDriver:
                         })
             return results
         
+        elif "MATCH p=(e)-[r:" in query_string and "relationships(p)" in query_string:
+            workspace_id = parameters.get("workspace_id", "")
+            requested = {str(item).lower() for item in parameters.get("entities_lower", [])}
+            entity_names = {
+                name for name, info in self.data["entities"].items()
+                if info.get("workspace") == workspace_id
+            }
+            adjacency = {}
+            for rel in self.data["relationships"]:
+                if (rel.get("workspace_id", workspace_id) != workspace_id
+                        or not rel.get("is_active", True)
+                        or rel.get("source") not in entity_names
+                        or rel.get("target") not in entity_names):
+                    continue
+                adjacency.setdefault(rel["source"], []).append(rel)
+
+            results = []
+            seen = set()
+            frontier = [name for name in entity_names if name.lower() in requested]
+            visited = set(frontier)
+            for _ in range(3):
+                next_frontier = []
+                for source in frontier:
+                    for rel in adjacency.get(source, []):
+                        target = rel["target"]
+                        row = (source, rel["type"], target)
+                        if row not in seen:
+                            seen.add(row)
+                            results.append({"source": source, "rel": rel["type"], "target": target})
+                        if target not in visited:
+                            visited.add(target)
+                            next_frontier.append(target)
+                frontier = next_frontier
+                if not frontier:
+                    break
+            return results
+
+        elif "cluster.name AS cluster" in query_string:
+            workspace_id = parameters.get("workspace_id", "")
+            requested = {str(item).lower() for item in parameters.get("entities_lower", [])}
+            results = []
+            for rel in self.data["relationships"]:
+                if rel.get("type") not in {"BELONGS_TO_TOPIC", "BELONGS_TO_PROFILE"}:
+                    continue
+                if rel.get("workspace_id", workspace_id) != workspace_id:
+                    continue
+                source = rel.get("source")
+                cluster = rel.get("target")
+                if source and source.lower() in requested:
+                    for neighbor_rel in self.data["relationships"]:
+                        if (neighbor_rel.get("type") == rel.get("type")
+                                and neighbor_rel.get("target") == cluster
+                                and neighbor_rel.get("source") != source
+                                and neighbor_rel.get("workspace_id", workspace_id) == workspace_id):
+                            results.append({"source": source, "cluster": cluster, "neighbor": neighbor_rel.get("source")})
+            return results
+
         elif "toLower(e.name)" in query_string:
             from collections import defaultdict
             workspace_id = parameters.get("workspace_id", "")
@@ -486,8 +572,10 @@ class Neo4jConnector:
             self.is_mock = False
             config._use_neo4j_fallback = False
         except Exception as e:
+            if not config.allow_in_memory_fallback():
+                raise RuntimeError("Neo4j is unavailable; refusing non-durable fallback.") from e
             if config._use_neo4j_fallback is None:
-                logger.warning("Neo4j database connection timed out or failed. Graph features operating in Mock mode.")
+                logger.warning("Neo4j connection failed. Using explicitly enabled in-memory adapter.")
             self._driver = MockNeo4jDriver()
             self.is_mock = True
             config._use_neo4j_fallback = True
@@ -500,7 +588,11 @@ class Neo4jConnector:
             return self._driver.query(query_string, parameters)
         with self._driver.session() as session:
             result = session.run(query_string, parameters or {})
-            return [record.data() for record in result]
+            try:
+                result_keys = list(result.keys())
+            except (AttributeError, TypeError):
+                result_keys = []
+            return [_normalize_neo4j_record(record, result_keys) for record in result]
 
 _neo4j_conn = None
 
@@ -509,9 +601,9 @@ def get_neo4j_conn():
     if _neo4j_conn is None:
         try:
             _neo4j_conn = Neo4jConnector()
-        except Exception as e:
-            logger.error(f"Failed to connect to Neo4j: {e}. Graph features will run in mock mode.")
-            _neo4j_conn = None
+        except Exception:
+            # Let startup and API callers surface an actionable dependency error.
+            raise
     return _neo4j_conn
 
 def close_neo4j_conn():

@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.env
+.env.*
+!.env.example
+archive
+tests
+*.log
+*.db
+*.sqlite
+work.md
+todo.md
+memoryos_pitchdeck.md

@@ -12,6 +12,7 @@ from memoryos.schemas.memory import MemoryIngest, MemoryRetrieve, IngestResponse
 
 # Persist & Helpers
 from memoryos.config import logger
+from memoryos.security import hash_api_key
 from memoryos.db.postgres import get_postgres_conn
 from memoryos.db.neo4j import get_neo4j_conn
 from memoryos.models.embeddings import get_embedding_model
@@ -46,18 +47,18 @@ def verify_workspace_key(workspace_id: str, authorization: Optional[str]):
             status_code=401,
             detail="Missing Authorization Header. Please provide Bearer <key>."
         )
-    key = authorization
-    if key.lower().startswith("bearer "):
-        key = key[7:].strip()
-        
+    key = authorization[7:].strip() if authorization.lower().startswith("bearer ") else authorization.strip()
+    if not key:
+        raise HTTPException(status_code=401, detail="Missing Bearer API key.")
+
     conn = get_postgres_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT workspace_id FROM api_keys WHERE key = %s", (key,))
+            cur.execute("SELECT workspace_id FROM api_keys WHERE key_hash = %s", (hash_api_key(key),))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=403, detail="Invalid API key credentials.")
-            
+
             db_workspace = row[0] if not isinstance(row, dict) else row["workspace_id"]
             if db_workspace != workspace_id:
                 raise HTTPException(status_code=403, detail=f"API key does not have access to workspace '{workspace_id}'.")
@@ -73,33 +74,33 @@ def format_context_markdown(results: list, temporal_range: tuple = None, working
         "GRAPH_FACT": ("## Knowledge Graph Context", []),
         "PROCEDURAL": ("## Procedural Recipes", []),
     }
-    
+
     timeline_items = []
     procedural_recipes = []
-    
+
     for item in results:
         mem_type = item.get("type", "EPISODIC")
         if mem_type == "PROCEDURAL":
             procedural_recipes.append(item)
             continue
-            
+
         if temporal_range and mem_type != "GRAPH_FACT":
             timeline_items.append(item)
-            
+
         if mem_type in sections:
             sections[mem_type][1].append(item)
         else:
             sections["EPISODIC"][1].append(item)
-            
+
     parts = []
-    
+
     # Prepend Active Working Memory state at the absolute top
     if working_memory_state:
         goal = working_memory_state.get("current_goal")
         constraints = working_memory_state.get("constraints", [])
         plan = working_memory_state.get("current_plan", [])
         scratchpad = working_memory_state.get("scratchpad", "")
-        
+
         if goal or constraints or plan or scratchpad:
             parts.append("## Active Working Memory")
             if goal:
@@ -113,7 +114,7 @@ def format_context_markdown(results: list, temporal_range: tuple = None, working
             if scratchpad:
                 parts.append(f"- **Scratchpad**: {scratchpad}")
             parts.append("")
-    
+
     # Prepend Procedural Recipes at the very top
     if procedural_recipes:
         parts.append("## Procedural Recipes")
@@ -129,12 +130,12 @@ def format_context_markdown(results: list, temporal_range: tuple = None, working
                     steps = [steps_data]
             else:
                 steps = steps_data
-                
+
             parts.append("Steps:")
             for idx, step in enumerate(steps, 1):
                 parts.append(f"{idx}. {step}")
             parts.append("")
-            
+
     # Chronological Timeline Event sequence
     if timeline_items:
         timeline_items.sort(key=lambda x: x.get("created_at", ""))
@@ -143,7 +144,7 @@ def format_context_markdown(results: list, temporal_range: tuple = None, working
             dt_str = item.get("created_at", "")[:10]
             parts.append(f"- [{dt_str}] {item['content']}")
         parts.append("")
-        
+
     for mem_type in ["FACTUAL", "PREFERENCE", "EPISODIC", "GRAPH_FACT"]:
         heading, items = sections[mem_type]
         if items:
@@ -151,12 +152,20 @@ def format_context_markdown(results: list, temporal_range: tuple = None, working
             for item in items:
                 parts.append(f"- {item['content']} (confidence: {item['score']:.2f})")
             parts.append("")
-            
+
     return "\n".join(parts).strip() if parts else "No relevant memories found."
 
 def background_access_updates(memory_ids: List[str]):
     """Increment access counts and refresh accessed timestamp."""
-    if not memory_ids:
+    valid_memory_ids = []
+    for memory_id in memory_ids:
+        try:
+            valid_memory_ids.append(str(uuid.UUID(str(memory_id))))
+        except (ValueError, TypeError, AttributeError):
+            # Graph and workflow result IDs are intentionally synthetic and
+            # must never be sent to PostgreSQL's uuid[] cast.
+            continue
+    if not valid_memory_ids:
         return
     try:
         conn = get_postgres_conn()
@@ -168,7 +177,7 @@ def background_access_updates(memory_ids: List[str]):
                     last_accessed_at = CURRENT_TIMESTAMP
                 WHERE id = ANY(%s::uuid[])
                 """,
-                (memory_ids,)
+                (valid_memory_ids,)
             )
         conn.commit()
         conn.close()
@@ -194,14 +203,14 @@ def compile_multidimensional_scores(item_info: dict, score: float, source: str) 
     confidence = float(score)
     importance = float(item_info.get("importance_score", 0.50) or 0.50)
     frequency = int(item_info.get("frequency_count", 1) or 1)
-    
+
     created_at = item_info.get("created_at")
     if isinstance(created_at, str):
         try:
             created_at = datetime.fromisoformat(created_at)
         except Exception:
             created_at = datetime.now(timezone.utc)
-            
+
     if created_at:
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
@@ -209,16 +218,16 @@ def compile_multidimensional_scores(item_info: dict, score: float, source: str) 
         recency = max(0.0, 1.0 - (delta_seconds / (30.0 * 86400.0)))
     else:
         recency = 1.0
-        
+
     mem_type = item_info.get("memory_type", "EPISODIC") or "EPISODIC"
     if importance >= 0.75 or mem_type == "FACTUAL" or source == "graph":
         verification = "verified"
     else:
         verification = "unverified"
-        
+
     decay_level = float(item_info.get("decay_level", 0.0) or 0.0)
     decay = max(0.1, 1.0 - decay_level)
-    
+
     return {
         "confidence": confidence,
         "importance": importance,
@@ -234,11 +243,11 @@ def classify_goal_category(goal: Optional[str]) -> str:
     if not goal:
         return "GENERAL"
     goal_lower = goal.lower()
-    
+
     dev_keywords = ["code", "deploy", "build", "rust", "python", "docker", "api", "database", "repository", "git", "programming", "plugin", "setup", "software", "development"]
     shop_keywords = ["buy", "purchase", "shopping", "budget", "price", "cost", "store", "product", "hire", "usd", "pay", "rate"]
     research_keywords = ["paper", "study", "research", "find information", "summary", "analyze", "trends", "science", "fact"]
-    
+
     if any(kw in goal_lower for kw in dev_keywords):
         return "DEVELOPER"
     if any(kw in goal_lower for kw in shop_keywords):
@@ -251,7 +260,7 @@ def apply_goal_boost(content: str, mem_type: str, score: float, category: str) -
     """Applies domain-specific score boosting to align memory with agent goals."""
     boosted_score = score
     content_lower = content.lower()
-    
+
     if category == "DEVELOPER":
         tech_terms = ["python", "rust", "docker", "neovim", "git", "github", "api", "database", "postgres", "sqlite", "sql", "axum", "plugin", "server", "coding"]
         if any(term in content_lower for term in tech_terms):
@@ -294,7 +303,7 @@ async def retrieve_context(
     # 2. Entity Graph Expansion via Neo4j
     graph_statements = []
     expanded_entities = []
-    
+
     neo4j = get_neo4j_conn()
     if neo4j and entities:
         try:
@@ -303,7 +312,7 @@ async def retrieve_context(
             graph_statements = expansion.get("graph_facts", [])
         except Exception as e:
             logger.error(f"Graph expansion failed: {e}")
-            
+
     # Fallback to substring matching if no graph statements found yet
     if not graph_statements and neo4j:
         try:
@@ -367,7 +376,7 @@ async def retrieve_context(
                 (query_embedding, data.user_id, data.workspace_id, query_embedding)
             )
             vector_results = cur.fetchall()
-            
+
             # 4. Dense Vector Search (episodes summary)
             cur.execute(
                 """
@@ -381,15 +390,15 @@ async def retrieve_context(
                 (query_embedding, data.user_id, data.workspace_id, query_embedding)
             )
             episode_results = cur.fetchall()
-            
+
             # 5. Scoped Sparse Keyword Search
             like_clauses = ["content ILIKE %s"]
             params = [data.user_id, data.workspace_id, f"%{data.query}%"]
-            
+
             for ent in expanded_entities[:5]:
                 like_clauses.append("content ILIKE %s")
                 params.append(f"%{ent}%")
-                
+
             clause_str = " OR ".join(like_clauses)
             cur.execute(
                 f"""
@@ -402,7 +411,7 @@ async def retrieve_context(
                 tuple(params)
             )
             keyword_results = cur.fetchall()
-            
+
             # If temporal query range is active, also pull all matches in that time range
             if start_time and end_time:
                 cur.execute(
@@ -419,7 +428,7 @@ async def retrieve_context(
                 temporal_mems = cur.fetchall()
                 vector_results.extend(temporal_mems)
                 keyword_results.extend(temporal_mems)
-                
+
                 cur.execute(
                     """
                     SELECT id, summary AS content, 'EPISODIC' AS memory_type, 0.80 AS importance_score, 1 AS frequency_count, created_at, 1.0 AS vector_similarity
@@ -433,7 +442,7 @@ async def retrieve_context(
                 )
                 temporal_eps = cur.fetchall()
                 episode_results.extend(temporal_eps)
-                
+
         conn.close()
     except Exception as e:
         logger.error(f"PostgreSQL query execution failed: {e}")
@@ -454,7 +463,7 @@ async def retrieve_context(
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return start_time <= dt <= end_time
-            
+
         vector_results = [r for r in vector_results if in_range(r['created_at'])]
         keyword_results = [r for r in keyword_results if in_range(r['created_at'])]
         episode_results = [r for r in episode_results if in_range(r['created_at'])]
@@ -463,9 +472,9 @@ async def retrieve_context(
     vector_rank = {str(row['id']): idx for idx, row in enumerate(vector_results)}
     keyword_rank = {str(row['id']): idx for idx, row in enumerate(keyword_results)}
     episode_rank = {str(row['id']): idx for idx, row in enumerate(episode_results)}
-    
+
     all_keys = set(vector_rank.keys()).union(set(keyword_rank.keys())).union(set(episode_rank.keys()))
-    
+
     info_map = {}
     for r in vector_results:
         info_map[str(r['id'])] = r
@@ -488,23 +497,23 @@ async def retrieve_context(
         v_rank = vector_rank.get(doc_id, 1e9)
         k_rank = keyword_rank.get(doc_id, 1e9)
         ep_rank = episode_rank.get(doc_id, 1e9)
-        
+
         score = (1.0 / (60.0 + v_rank)) + (1.0 / (60.0 + k_rank)) + (1.0 / (60.0 + ep_rank))
-        
+
         # Entity-based boost
         content_lower = info_map[doc_id]['content'].lower()
         if any(ent in content_lower for ent in expanded_entities):
             score *= 1.2
-            
+
         rrf_candidates.append((doc_id, score))
-        
+
     rrf_candidates.sort(key=lambda x: x[1], reverse=True)
     top_candidates = rrf_candidates[:15]
-    
+
     # Boost STM-cached items
     stm_items = stm_cache.get(data.user_id, data.workspace_id)
     stm_ids = {item["memory_id"] for item in stm_items}
-    
+
     final_items = []
     if top_candidates:
         pairs = [(embedding_query, info_map[doc_id]['content']) for doc_id, _ in top_candidates]
@@ -512,7 +521,7 @@ async def retrieve_context(
             reranker = get_reranker_model()
             scores_res = reranker.predict(pairs)
             rerank_scores = scores_res.tolist() if hasattr(scores_res, "tolist") else list(scores_res)
-            
+
             for idx, (doc_id, _) in enumerate(top_candidates):
                 item_info = info_map[doc_id]
                 created_val = item_info['created_at']
@@ -551,7 +560,7 @@ async def retrieve_context(
                     "created_at": created_str,
                     **m_scores
                 })
-                
+
     # Append Graph statements to context results
     for index, stmt in enumerate(graph_statements):
         graph_item_info = {
@@ -569,16 +578,16 @@ async def retrieve_context(
             "created_at": datetime.now(timezone.utc).isoformat(),
             **m_scores
         })
-        
+
     final_items.sort(key=lambda x: x['score'], reverse=True)
     results = final_items[:data.limit]
-    
+
     # 5.5 Check for matching workflows if query/goal suggests procedural intent
     procedural_items = []
     procedural_triggers = ["how to", "how do i", "steps", "workflow", "recipe", "deploy", "build", "configure", "setup"]
     query_lower = data.query.lower()
     goal_lower = data.current_goal.lower() if data.current_goal else ""
-    
+
     if any(trigger in query_lower for trigger in procedural_triggers) or any(trigger in goal_lower for trigger in procedural_triggers):
         try:
             import re
@@ -610,7 +619,7 @@ async def retrieve_context(
                         (data.user_id, data.workspace_id)
                     )
                 workflow_rows = cur.fetchall()
-                
+
                 for row in workflow_rows:
                     wf_item_info = {
                         "importance_score": 0.90,
@@ -619,9 +628,18 @@ async def retrieve_context(
                         "memory_type": "FACTUAL"
                     }
                     m_scores = compile_multidimensional_scores(wf_item_info, 0.99, "system")
+                    steps = row['steps']
+                    if isinstance(steps, str):
+                        try:
+                            parsed_steps = json.loads(steps)
+                            steps = parsed_steps if isinstance(parsed_steps, list) else [parsed_steps]
+                        except (TypeError, ValueError):
+                            steps = [steps]
+                    else:
+                        steps = list(steps or [])
                     procedural_items.append({
                         "memory_id": f"workflow_{row['id']}",
-                        "content": row['steps'],
+                        "content": json.dumps(steps, ensure_ascii=False),
                         "name": row['name'],
                         "description": row['description'],
                         "score": 0.99,
@@ -637,12 +655,12 @@ async def retrieve_context(
         results = [r for r in results if not r['memory_id'].startswith("workflow_")]
         results = procedural_items + results
         results = results[:data.limit]
-    
+
     # Increment access logs in background
     background_access_updates([item['memory_id'] for item in results if not item['memory_id'].startswith("graph_")])
-    
+
     token_count = sum(len(item['content'].split()) for item in results)
-    
+
     if format == "markdown":
         markdown_text = format_context_markdown(results, temporal_range=(start_time, end_time) if start_time else None, working_memory_state=active_wm)
         return {
@@ -651,7 +669,7 @@ async def retrieve_context(
             "context_token_count": int(token_count * 1.3),
             "goal_category": goal_category
         }
-    
+
     return RetrieveResponse(
         results=[MemoryItem(**item) for item in results],
         context_token_count=int(token_count * 1.3),
@@ -671,7 +689,7 @@ async def apply_decay(authorization: Optional[str] = Header(None)):
     except Exception as e:
         logger.error(f"Failed to run decay cron job: {e}")
         raise HTTPException(status_code=500, detail="Decay process failed.")
-        
+
     return {"status": "success", "archived_count": decayed_count}
 
 @router.post("/v1/memories/consolidate")
@@ -686,7 +704,7 @@ async def consolidate_memories(
     """
     merged_count = 0
     entity_dedup_count = 0
-    
+
     try:
         conn = get_postgres_conn()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -696,11 +714,11 @@ async def consolidate_memories(
                 (user_id, workspace_id)
             )
             rows = cur.fetchall()
-            
+
             if len(rows) < 2:
                 return {"status": "success", "merged_memories": 0, "deduplicated_entities": 0,
                         "message": "Not enough memories to consolidate."}
-            
+
             memories = []
             for row in rows:
                 emb = row['embedding']
@@ -713,7 +731,7 @@ async def consolidate_memories(
                     "importance": float(row['importance_score']),
                     "frequency": int(row['frequency_count'])
                 })
-            
+
             deactivate_ids = set()
             for i in range(len(memories)):
                 if memories[i]["id"] in deactivate_ids:
@@ -726,30 +744,30 @@ async def consolidate_memories(
                     norm_a = math.sqrt(sum(x * x for x in a))
                     norm_b = math.sqrt(sum(x * x for x in b))
                     sim = dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
-                    
+
                     if sim > 0.88:
                         if memories[i]["importance"] >= memories[j]["importance"]:
                             survivor, victim = memories[i], memories[j]
                         else:
                             survivor, victim = memories[j], memories[i]
-                        
+
                         deactivate_ids.add(victim["id"])
                         cur.execute(
                             "UPDATE memories SET frequency_count = frequency_count + %s WHERE id = %s",
                             (victim["frequency"], survivor["id"])
                         )
                         merged_count += 1
-            
+
             for vid in deactivate_ids:
                 cur.execute("UPDATE memories SET is_active = FALSE WHERE id = %s", (vid,))
-        
+
         conn.commit()
         conn.close()
-        
+
     except Exception as e:
         logger.error(f"Consolidation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Consolidation failed: {e}")
-    
+
     neo4j = get_neo4j_conn()
     if neo4j:
         try:
@@ -775,7 +793,7 @@ async def consolidate_memories(
                         entity_dedup_count += 1
         except Exception as e:
             logger.error(f"Neo4j entity dedup failed: {e}")
-    
+
     return {
         "status": "success",
         "merged_memories": merged_count,
@@ -800,7 +818,7 @@ async def clear_all_memories(
             cur.execute("DELETE FROM conversation_logs WHERE user_id = %s AND workspace_id = %s", (user_id, workspace_id))
         conn.commit()
         conn.close()
-        
+
         neo4j = get_neo4j_conn()
         if neo4j:
             is_mock = getattr(neo4j, "is_mock", False)
@@ -822,7 +840,7 @@ async def clear_all_memories(
     except Exception as e:
         logger.error(f"Failed to clear memories: {e}")
         raise HTTPException(status_code=500, detail="Hard deletion failed.")
-        
+
     return {"status": "success", "message": f"All memories for user {user_id} in workspace {workspace_id} purged successfully."}
 
 @router.post("/v1/memories/reflect")
@@ -835,13 +853,13 @@ async def trigger_reflection(data: MemoryReflect, authorization: Optional[str] =
     neo4j = get_neo4j_conn()
     if not neo4j:
         raise HTTPException(status_code=500, detail="Neo4j connection not available.")
-        
+
     try:
         facts = run_reflection(data.user_id, data.workspace_id, neo4j)
     except Exception as e:
         logger.error(f"Reflection execution failed: {e}")
         raise HTTPException(status_code=500, detail="Reflection failed.")
-        
+
     return {
         "status": "success",
         "synthesized_facts_count": len(facts),
@@ -859,13 +877,13 @@ async def trigger_consolidation(data: MemoryReflect, authorization: Optional[str
     neo4j = get_neo4j_conn()
     if not neo4j:
         raise HTTPException(status_code=500, detail="Neo4j connection not available.")
-        
+
     try:
         res = consolidate_hierarchy(data.user_id, data.workspace_id, neo4j)
     except Exception as e:
         logger.error(f"Consolidation execution failed: {e}")
         raise HTTPException(status_code=500, detail="Consolidation failed.")
-        
+
     return res
 
 @router.post("/v1/memories/workflows")
@@ -876,67 +894,20 @@ async def ingest_workflow(data: WorkflowIngest, authorization: Optional[str] = H
     relational database and links it to technical entities in the Neo4j Knowledge Graph.
     """
     log_event(data.user_id, data.workspace_id, "WORKFLOW_INGESTED", data.dict())
-    workflow_id = str(uuid.uuid4())
-    
+
+    from memoryos.core.event_store import execute_workflow_ingest
     try:
-        conn = get_postgres_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO workflows (id, user_id, workspace_id, name, description, steps)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (workflow_id, data.user_id, data.workspace_id, data.name, data.description, json.dumps(data.steps))
-            )
-        conn.commit()
-        conn.close()
+        workflow_id = execute_workflow_ingest(
+            user_id=data.user_id,
+            workspace_id=data.workspace_id,
+            name=data.name,
+            description=data.description,
+            steps=data.steps
+        )
     except Exception as e:
-        logger.error(f"[Procedural] Failed to insert workflow into DB: {e}")
+        logger.error(f"[Procedural] Ingestion failed: {e}")
         raise HTTPException(status_code=500, detail="Failed to store workflow in database.")
 
-    neo4j = get_neo4j_conn()
-    if neo4j:
-        try:
-            neo4j.query(
-                """
-                MERGE (w:Workflow {name: $name, workspace_id: $workspace_id})
-                SET w.description = $description
-                """,
-                {"name": data.name, "description": data.description, "workspace_id": data.workspace_id}
-            )
-            
-            neo4j.query(
-                """
-                MATCH (u:User {id: $user_id, workspace_id: $workspace_id})
-                MATCH (w:Workflow {name: $name, workspace_id: $workspace_id})
-                MERGE (u)-[r:HAS_WORKFLOW]->(w)
-                SET r.is_active = true
-                """,
-                {"user_id": data.user_id, "name": data.name, "workspace_id": data.workspace_id}
-            )
-            
-            tech_keywords = ["docker", "postgres", "sqlite", "neovim", "python", "rust", "railway", "github", "git"]
-            detected_techs = set()
-            for step in data.steps:
-                step_lower = step.lower()
-                for tech in tech_keywords:
-                    if tech in step_lower:
-                        detected_techs.add(tech)
-                        
-            for tech in detected_techs:
-                neo4j.query(
-                    """
-                    MATCH (t:Entity {name: $tech, workspace_id: $workspace_id})
-                    MATCH (w:Workflow {name: $name, workspace_id: $workspace_id})
-                    MERGE (w)-[r:USES_TECH]->(t)
-                    SET r.is_active = true
-                    """,
-                    {"tech": tech, "name": data.name, "workspace_id": data.workspace_id}
-                )
-                
-        except Exception as e:
-            logger.error(f"[Procedural] Failed to update Neo4j with workflow nodes: {e}")
-            
     return WorkflowResponse(
         status="success",
         workflow_id=workflow_id,
@@ -1042,7 +1013,7 @@ async def get_job_status(
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Job not found.")
-                
+
             verify_workspace_key(row["workspace_id"], authorization)
             return dict(row)
     finally:

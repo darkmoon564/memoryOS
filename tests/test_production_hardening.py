@@ -21,13 +21,14 @@ from memoryos.api.memories import (
     get_job_status
 )
 from memoryos.services.background import background_graph_ingest
+from memoryos.security import hash_api_key
 
 def seed_api_key(key: str, workspace_id: str):
     conn = get_postgres_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO api_keys (key, workspace_id, description) VALUES (%s, %s, %s) ON CONFLICT (key) DO NOTHING",
-            (key, workspace_id, "Test API Key")
+            "INSERT INTO api_keys (key_hash, workspace_id, description) VALUES (%s, %s, %s) ON CONFLICT (key_hash) DO NOTHING",
+            (hash_api_key(key), workspace_id, "Test API Key")
         )
     conn.commit()
     conn.close()
@@ -36,8 +37,8 @@ def cleanup_api_keys():
     conn = get_postgres_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "DELETE FROM api_keys WHERE key IN (%s, %s)",
-            ("key_default", "key_api_test")
+            "DELETE FROM api_keys WHERE key_hash IN (%s, %s)",
+            (hash_api_key("key_default"), hash_api_key("key_api_test"))
         )
     conn.commit()
     conn.close()
@@ -114,10 +115,14 @@ def test_production_hardening_suite():
     print("\nStep 3: Verifying relationship enum mapping and Cypher validation...")
     neo4j = get_neo4j_conn()
     assert neo4j is not None
-    
+    is_mock = getattr(neo4j, "is_mock", False)
+
     # Clean mock graph
-    _mock_graph_data["entities"].clear()
-    _mock_graph_data["relationships"].clear()
+    if is_mock:
+        _mock_graph_data["entities"].clear()
+        _mock_graph_data["relationships"].clear()
+    else:
+        neo4j.query("MATCH (n) DETACH DELETE n")
     
     # Ingest a whitelisted relation
     background_graph_ingest(
@@ -126,24 +131,41 @@ def test_production_hardening_suite():
         user_id="user_test",
         workspace_id="default"
     )
-    # Check mock relationships
-    rels = _mock_graph_data["relationships"]
+    # Check the active graph adapter, whether mock or real Neo4j.
+    if is_mock:
+        rels = _mock_graph_data["relationships"]
+    else:
+        rels = neo4j.query(
+            "MATCH (:Entity {name: $source})-[r:LIVES_IN]->(:Entity {name: $target}) RETURN r",
+            {"source": "alice", "target": "seattle"},
+        )
     assert len(rels) > 0
-    assert rels[0]["type"] == "LIVES_IN"
+    if is_mock:
+        assert rels[0]["type"] == "LIVES_IN"
     print("  Whitelisted relationship type 'LIVES_IN' inserted successfully.")
     
     # Ingest a non-whitelisted relation (e.g. MAKES_COFFEE)
-    _mock_graph_data["relationships"].clear()
+    if is_mock:
+        _mock_graph_data["relationships"].clear()
+    else:
+        neo4j.query("MATCH (n) DETACH DELETE n")
     background_graph_ingest(
         memory_id="mem-2",
         content="Alice drives a Tesla.",
         user_id="user_test",
         workspace_id="default"
     )
-    rels = _mock_graph_data["relationships"]
+    if is_mock:
+        rels = _mock_graph_data["relationships"]
+    else:
+        rels = neo4j.query(
+            "MATCH (:Entity {name: $source})-[r:RELATED_TO]->(:Entity {name: $target}) RETURN r",
+            {"source": "alice", "target": "tesla"},
+        )
     assert len(rels) > 0
-    # MAKES_COFFEE should map to fallback RELATED_TO
-    assert rels[0]["type"] == "RELATED_TO"
+    # Unsupported relation extraction should map to RELATED_TO.
+    if is_mock:
+        assert rels[0]["type"] == "RELATED_TO"
     print("  Non-whitelisted relationship mapped to fallback type 'RELATED_TO' successfully.")
 
     # 4. Asynchronous Replay Determinism and Job Tracking
@@ -204,13 +226,20 @@ def test_production_hardening_suite():
     
     # 5. Health Check Endpoint
     print("\nStep 5: Verifying Health Check status structure...")
-    from memoryos.main import health_check
+    from memoryos.main import health_check, readiness_check
     health_res = asyncio.run(health_check())
     print(f"  Health Check result: {health_res}")
     assert "status" in health_res
-    assert "dependencies" in health_res
-    assert health_res["dependencies"]["postgres"] == "connected"
-    print("  Health endpoint active and returning connectivity state.")
+    assert health_res["status"] == "ok"
+    readiness_res = asyncio.run(readiness_check())
+    readiness_body = readiness_res.body
+    if isinstance(readiness_body, bytes):
+        import json
+        readiness_body = json.loads(readiness_body.decode("utf-8"))
+    print(f"  Readiness result: {readiness_body}")
+    assert "dependencies" in readiness_body
+    assert readiness_body["dependencies"]["postgres"] == "connected"
+    print("  Liveness and readiness endpoints return their documented contracts.")
     
     cleanup_api_keys()
     conn.close()

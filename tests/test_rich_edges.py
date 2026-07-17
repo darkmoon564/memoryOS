@@ -47,13 +47,17 @@ def test_rich_edges():
         assert r.get("workspace_id") == "default", "Expected workspace_id 'default'"
         assert "timestamp" in r, "Expected timestamp property to exist"
     else:
-        res = neo4j.query("MATCH (:Entity)-[r:WORKS_AT]->(:Entity) RETURN r")
+        res = neo4j.query(
+            "MATCH (:Entity)-[r:WORKS_AT]->(:Entity) "
+            "RETURN r.version AS version, r.evidence_count AS evidence_count, "
+            "r.source_memory_id AS source_memory_id"
+        )
         assert len(res) == 1, "Expected 1 relationship in Neo4j"
-        r = res[0]["r"]
-        print(f"  Assertion 1 (Create): version={r.get('version')}, evidence_count={r.get('evidence_count')}, source_memory_id={r.get('source_memory_id')}")
-        assert r.get("version") == 1
-        assert r.get("evidence_count") == 1
-        assert r.get("source_memory_id") == "m1"
+        row = res[0]
+        print(f"  Assertion 1 (Create): version={row['version']}, evidence_count={row['evidence_count']}, source_memory_id={row['source_memory_id']}")
+        assert row["version"] == 1
+        assert row["evidence_count"] == 1
+        assert row["source_memory_id"] == "m1"
         
     # 3. Ingest SAME Fact from SAME Memory 1 (Duplicate Assertion)
     print("\nStep 2: Ingesting 'Alice works at Acme.' again from SAME source memory 'm1'...")
@@ -69,12 +73,16 @@ def test_rich_edges():
         assert r.get("evidence_count") == 1, f"Expected evidence_count 1 (no change), got {r.get('evidence_count')}"
         assert r.get("source_memory_id") == "m1", "Expected source_memory_id 'm1'"
     else:
-        res = neo4j.query("MATCH (:Entity)-[r:WORKS_AT]->(:Entity) RETURN r")
-        r = res[0]["r"]
-        print(f"  Assertion 2 (Match same source): version={r.get('version')}, evidence_count={r.get('evidence_count')}, source_memory_id={r.get('source_memory_id')}")
-        assert r.get("version") == 2
-        assert r.get("evidence_count") == 1
-        assert r.get("source_memory_id") == "m1"
+        res = neo4j.query(
+            "MATCH (:Entity)-[r:WORKS_AT]->(:Entity) "
+            "RETURN r.version AS version, r.evidence_count AS evidence_count, "
+            "r.source_memory_id AS source_memory_id"
+        )
+        row = res[0]
+        print(f"  Assertion 2 (Match same source): version={row['version']}, evidence_count={row['evidence_count']}, source_memory_id={row['source_memory_id']}")
+        assert row["version"] == 2
+        assert row["evidence_count"] == 1
+        assert row["source_memory_id"] == "m1"
         
     # 4. Ingest SAME Fact from DIFFERENT Memory 2 (New Evidence)
     print("\nStep 3: Ingesting 'Alice works at Acme.' from DIFFERENT source memory 'm2'...")
@@ -90,12 +98,16 @@ def test_rich_edges():
         assert r.get("evidence_count") == 2, f"Expected evidence_count 2 (incremented), got {r.get('evidence_count')}"
         assert r.get("source_memory_id") == "m2", "Expected source_memory_id updated to 'm2'"
     else:
-        res = neo4j.query("MATCH (:Entity)-[r:WORKS_AT]->(:Entity) RETURN r")
-        r = res[0]["r"]
-        print(f"  Assertion 3 (Match new source): version={r.get('version')}, evidence_count={r.get('evidence_count')}, source_memory_id={r.get('source_memory_id')}")
-        assert r.get("version") == 3
-        assert r.get("evidence_count") == 2
-        assert r.get("source_memory_id") == "m2"
+        res = neo4j.query(
+            "MATCH (:Entity)-[r:WORKS_AT]->(:Entity) "
+            "RETURN r.version AS version, r.evidence_count AS evidence_count, "
+            "r.source_memory_id AS source_memory_id"
+        )
+        row = res[0]
+        print(f"  Assertion 3 (Match new source): version={row['version']}, evidence_count={row['evidence_count']}, source_memory_id={row['source_memory_id']}")
+        assert row["version"] == 3
+        assert row["evidence_count"] == 2
+        assert row["source_memory_id"] == "m2"
         
     print("\n" + "=" * 60)
     print("  Rich Edge Metadata & versioning tests completed successfully!")

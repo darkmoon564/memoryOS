@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 from datetime import datetime, timezone, timedelta
+from unittest.mock import patch
 
 # Ensure package is in path if run directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -111,9 +112,13 @@ def test_temporal_memory_system():
     # Test A: June Query
     req_june = MemoryRetrieve(user_id=user_id, workspace_id=workspace_id, query="Where was I working in June?", limit=10)
     
-    # Mocking datetime.now in memories retrieve_context if needed (we pass query which parses relative to current time,
-    # but 'June' parses absolutely to June 2026 regardless of the current hour, so it works directly!)
-    res_june = asyncio.run(retrieve_context(req_june, format="markdown"))
+    # Keep relative windows deterministic while exercising the production
+    # retrieval path with the same clock used to seed the records.
+    with patch(
+        "memoryos.api.memories.parse_temporal_window",
+        lambda query: parse_temporal_window(query, current_time=current_test_time),
+    ):
+        res_june = asyncio.run(retrieve_context(req_june, format="markdown"))
     markdown_text = res_june["markdown"]
     print("\n  Markdown Context for 'June' query:")
     print(markdown_text)
@@ -126,11 +131,12 @@ def test_temporal_memory_system():
     assert "[2026-06-15]" in markdown_text, "Expected date format in chronological timeline"
     
     # Test B: Yesterday Query
-    # Since yesterday parses relative to current system clock in retrieve_context, let's test if we query for "yesterday"
-    # (Because the API retrieves relative to the actual current system clock, if we run it today, yesterday is July 13th,
-    # and since we inserted July 13th in the database, it will match! Outstanding!)
     req_yest = MemoryRetrieve(user_id=user_id, workspace_id=workspace_id, query="what did i do yesterday?", limit=10)
-    res_yest = asyncio.run(retrieve_context(req_yest, format="markdown"))
+    with patch(
+        "memoryos.api.memories.parse_temporal_window",
+        lambda query: parse_temporal_window(query, current_time=current_test_time),
+    ):
+        res_yest = asyncio.run(retrieve_context(req_yest, format="markdown"))
     markdown_yest = res_yest["markdown"]
     print("\n  Markdown Context for 'yesterday' query:")
     print(markdown_yest)
@@ -145,4 +151,6 @@ def test_temporal_memory_system():
     print("=" * 60)
 
 if __name__ == "__main__":
-    test_temporal_memory_system()
+    from unittest.mock import patch
+    with patch("memoryos.api.memories.verify_workspace_key", return_value=None):
+        test_temporal_memory_system()
