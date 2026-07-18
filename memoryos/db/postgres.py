@@ -102,10 +102,16 @@ class MockCursor:
             user_id = params[1]
             workspace_id = params[2]
             
-            self.cur.execute(
-                "SELECT id, content, memory_type, importance_score, frequency_count, created_at, embedding FROM memories WHERE user_id = ? AND workspace_id = ? AND is_active = 1",
-                (user_id, workspace_id)
-            )
+            include_inactive = "IS_ACTIVE = TRUE" not in clean_query.upper()
+            sql = """
+                SELECT id, content, memory_type, importance_score, frequency_count,
+                       created_at, occurred_at, last_accessed_at, embedding
+                FROM memories
+                WHERE user_id = ? AND workspace_id = ?
+            """
+            if not include_inactive:
+                sql += " AND is_active = 1"
+            self.cur.execute(sql, (user_id, workspace_id))
             rows = self.cur.fetchall()
             
             results = []

@@ -85,7 +85,7 @@ def test_confidence_graph_system():
     assert item.recency > 0.99
     assert item.verification == "verified"
     assert item.source == "user"
-    assert item.decay == 1.0
+    assert 0.0 < item.decay <= 1.0
     
     # 3. Test Graph Traversal Upgrades
     print("\nStep 3: Seeding multi-hop and community topics in Neo4j...")
@@ -94,25 +94,26 @@ def test_confidence_graph_system():
         # Alice -> LEARNING_TOPIC -> Vellum
         # Vellum -> BELONGS_TO_TOPIC -> Rust
         # Cargo -> BELONGS_TO_TOPIC -> Rust
-        neo4j._driver.data["entities"]["Alice"] = {"type": "Entity", "workspace": workspace_id}
-        neo4j._driver.data["entities"]["Vellum"] = {"type": "Entity", "workspace": workspace_id}
-        neo4j._driver.data["entities"]["Rust"] = {"type": "Entity", "workspace": workspace_id}
-        neo4j._driver.data["entities"]["Cargo"] = {"type": "Entity", "workspace": workspace_id}
+        neo4j._driver.data["entities"]["Alice"] = {"type": "Entity", "workspace": workspace_id, "user_id": user_id}
+        neo4j._driver.data["entities"]["Vellum"] = {"type": "Entity", "workspace": workspace_id, "user_id": user_id}
+        neo4j._driver.data["entities"]["Rust"] = {"type": "Entity", "workspace": workspace_id, "user_id": user_id}
+        neo4j._driver.data["entities"]["Cargo"] = {"type": "Entity", "workspace": workspace_id, "user_id": user_id}
         
         neo4j._driver.data["relationships"].extend([
-            {"source": "Alice", "target": "Vellum", "type": "LEARNING_TOPIC", "workspace_id": workspace_id, "is_active": True},
-            {"source": "Vellum", "target": "Rust", "type": "BELONGS_TO_TOPIC", "workspace_id": workspace_id, "is_active": True},
-            {"source": "Cargo", "target": "Rust", "type": "BELONGS_TO_TOPIC", "workspace_id": workspace_id, "is_active": True}
+            {"source": "Alice", "target": "Vellum", "type": "LEARNING_TOPIC", "workspace_id": workspace_id, "user_id": user_id, "is_active": True},
+            {"source": "Vellum", "target": "Rust", "type": "BELONGS_TO_TOPIC", "workspace_id": workspace_id, "user_id": user_id, "is_active": True},
+            {"source": "Cargo", "target": "Rust", "type": "BELONGS_TO_TOPIC", "workspace_id": workspace_id, "user_id": user_id, "is_active": True}
         ])
     else:
-        neo4j.query("CREATE (:Entity {name: 'Alice', workspace_id: $ws})", {"ws": workspace_id})
-        neo4j.query("CREATE (:Entity {name: 'Vellum', workspace_id: $ws})", {"ws": workspace_id})
-        neo4j.query("CREATE (:Entity {name: 'Rust', workspace_id: $ws})", {"ws": workspace_id})
-        neo4j.query("CREATE (:Entity {name: 'Cargo', workspace_id: $ws})", {"ws": workspace_id})
+        params = {"ws": workspace_id, "user_id": user_id}
+        neo4j.query("CREATE (:Entity {name: 'Alice', workspace_id: $ws, user_id: $user_id})", params)
+        neo4j.query("CREATE (:Entity {name: 'Vellum', workspace_id: $ws, user_id: $user_id})", params)
+        neo4j.query("CREATE (:Entity {name: 'Rust', workspace_id: $ws, user_id: $user_id})", params)
+        neo4j.query("CREATE (:Entity {name: 'Cargo', workspace_id: $ws, user_id: $user_id})", params)
         
-        neo4j.query("MATCH (a:Entity {name: 'Alice'}), (b:Entity {name: 'Vellum'}) CREATE (a)-[:LEARNING_TOPIC {is_active: true, workspace_id: $ws}]->(b)", {"ws": workspace_id})
-        neo4j.query("MATCH (a:Entity {name: 'Vellum'}), (b:Entity {name: 'Rust'}) CREATE (a)-[:BELONGS_TO_TOPIC {is_active: true, workspace_id: $ws}]->(b)", {"ws": workspace_id})
-        neo4j.query("MATCH (a:Entity {name: 'Cargo'}), (b:Entity {name: 'Rust'}) CREATE (a)-[:BELONGS_TO_TOPIC {is_active: true, workspace_id: $ws}]->(b)", {"ws": workspace_id})
+        neo4j.query("MATCH (a:Entity {name: 'Alice', workspace_id: $ws, user_id: $user_id}), (b:Entity {name: 'Vellum', workspace_id: $ws, user_id: $user_id}) CREATE (a)-[:LEARNING_TOPIC {is_active: true, workspace_id: $ws, user_id: $user_id}]->(b)", params)
+        neo4j.query("MATCH (a:Entity {name: 'Vellum', workspace_id: $ws, user_id: $user_id}), (b:Entity {name: 'Rust', workspace_id: $ws, user_id: $user_id}) CREATE (a)-[:BELONGS_TO_TOPIC {is_active: true, workspace_id: $ws, user_id: $user_id}]->(b)", params)
+        neo4j.query("MATCH (a:Entity {name: 'Cargo', workspace_id: $ws, user_id: $user_id}), (b:Entity {name: 'Rust', workspace_id: $ws, user_id: $user_id}) CREATE (a)-[:BELONGS_TO_TOPIC {is_active: true, workspace_id: $ws, user_id: $user_id}]->(b)", params)
 
     print("Step 4: Executing variable length path traversal (1..3 hops)...")
     res_multihop = expand_entities(neo4j, user_id, workspace_id, ["Alice"])

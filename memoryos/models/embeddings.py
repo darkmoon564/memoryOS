@@ -39,9 +39,16 @@ def get_embedding_model():
             config._embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
             logger.info("Local SentenceTransformer embedding model loaded successfully.")
         except Exception as e:
-            logger.warning(
-                f"Failed to load sentence-transformers model ({e}). "
-                "Operating in Zero-Dependency Mock ML mode (MockEmbeddingModel)."
-            )
-            config._embedding_model = MockEmbeddingModel()
+            if os.getenv("MEMORYOS_ALLOW_MOCK_MODELS", "false").lower() == "true":
+                logger.warning(
+                    "Embedding model failed to load; using the explicitly enabled non-semantic mock model: %s",
+                    e,
+                )
+                config._embedding_model = MockEmbeddingModel()
+            else:
+                raise RuntimeError(
+                    "Unable to load the semantic embedding model. Install the full model image or set "
+                    "OFFLINE_MODE=true only for deterministic tests. To explicitly allow non-semantic "
+                    "development mocks, set MEMORYOS_ALLOW_MOCK_MODELS=true."
+                ) from e
     return config._embedding_model

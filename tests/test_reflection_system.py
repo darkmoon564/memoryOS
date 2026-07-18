@@ -81,7 +81,8 @@ def test_reflection_system():
     print("\nStep 2: Triggering run_reflection manually...")
     facts = run_reflection(user_id, workspace_id, neo4j)
     
-    # Verify raw logs were archived and deleted
+    # Verify raw logs were removed after projection. Durable event records are
+    # the replay source; reflection must not create an undeletable file archive.
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM conversation_logs WHERE user_id = %s", (user_id,))
         cnt = cur.fetchone()[0]
@@ -103,16 +104,16 @@ def test_reflection_system():
     else:
         # Real Neo4j verification
         res_rels = neo4j.query(
-            "MATCH (s:Entity {workspace_id: $workspace_id})-[r]->(t:Entity) "
+            "MATCH (s:Entity {workspace_id: $workspace_id, user_id: $user_id})-[r {user_id: $user_id}]->(t:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
             "WHERE s.name = 'user' RETURN type(r) AS type, t.name AS target",
-            {"workspace_id": workspace_id}
+            {"workspace_id": workspace_id, "user_id": user_id}
         )
         print(f"  Neo4j Relationships created: {[(record['type'], record['target']) for record in res_rels]}")
         assert len(res_rels) > 0, "Expected synthesized relationships in Neo4j"
         
         res_knows = neo4j.query(
-            "MATCH (u:User {id: $user_id})-[r:KNOWS_ABOUT]->(e:Entity) RETURN e.name AS target",
-            {"user_id": user_id}
+            "MATCH (u:User {id: $user_id, workspace_id: $workspace_id})-[r:KNOWS_ABOUT {user_id: $user_id}]->(e:Entity {workspace_id: $workspace_id, user_id: $user_id}) RETURN e.name AS target",
+            {"user_id": user_id, "workspace_id": workspace_id}
         )
         print(f"  User KNOWS_ABOUT entities: {[record['target'] for record in res_knows]}")
         assert len(res_knows) > 0, "Expected User to connect via KNOWS_ABOUT in Neo4j"

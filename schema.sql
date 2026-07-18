@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS conversation_logs (
     workspace_id VARCHAR(64) NOT NULL DEFAULT 'default',
     episode_id UUID REFERENCES episodes(id) ON DELETE SET NULL,
     content TEXT NOT NULL,
+    source_event_id VARCHAR(256),
+    occurred_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -56,8 +58,18 @@ CREATE TABLE IF NOT EXISTS memories (
     frequency_count INT NOT NULL DEFAULT 1,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     fingerprint VARCHAR(64),
+    occurred_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     last_accessed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Provenance is intentionally many-to-one: identical facts can be observed
+-- in multiple source turns without duplicating the canonical memory record.
+CREATE TABLE IF NOT EXISTS memory_sources (
+    memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    source_event_id VARCHAR(256) NOT NULL,
+    occurred_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    PRIMARY KEY (memory_id, source_event_id)
 );
 
 -- Indices for vector searches and text fuzzy matching
@@ -65,10 +77,16 @@ CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedd
 CREATE INDEX IF NOT EXISTS idx_memories_trgm ON memories USING gin (content gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_memories_lookup ON memories(user_id, workspace_id, is_active);
 CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(user_id, workspace_id, fingerprint, is_active);
+CREATE INDEX IF NOT EXISTS idx_memories_occurred_at ON memories(user_id, workspace_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_sources_event ON memory_sources(source_event_id);
 
 CREATE INDEX IF NOT EXISTS idx_episodes_embedding ON episodes USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_episodes_lookup ON episodes(user_id, workspace_id);
 CREATE INDEX IF NOT EXISTS idx_conv_logs_lookup ON conversation_logs(user_id, workspace_id, episode_id);
+CREATE INDEX IF NOT EXISTS idx_conv_logs_occurred_at ON conversation_logs(user_id, workspace_id, occurred_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_logs_source_event
+    ON conversation_logs(user_id, workspace_id, source_event_id)
+    WHERE source_event_id IS NOT NULL;
 
 -- Workflows (Procedural Memory)
 CREATE TABLE IF NOT EXISTS workflows (
@@ -113,6 +131,25 @@ CREATE TABLE IF NOT EXISTS graph_projection_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_graph_projection_outbox_pending
     ON graph_projection_outbox(status, next_attempt_at, created_at);
+
+-- Durable graph erasure work. A user-data purge commits its relational
+-- deletion and this cleanup request together, then the worker removes the
+-- corresponding derived graph state with retries.
+CREATE TABLE IF NOT EXISTS graph_deletion_outbox (
+    id UUID PRIMARY KEY,
+    user_id VARCHAR(64) NOT NULL,
+    workspace_id VARCHAR(64) NOT NULL,
+    memory_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+    attempts INT NOT NULL DEFAULT 0,
+    error_message TEXT,
+    next_attempt_at TIMESTAMP WITH TIME ZONE,
+    locked_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_graph_deletion_outbox_due
+    ON graph_deletion_outbox(status, next_attempt_at, created_at);
 
 -- Workspace API Keys
 CREATE TABLE IF NOT EXISTS api_keys (

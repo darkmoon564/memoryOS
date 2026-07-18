@@ -14,41 +14,72 @@ def calculate_importance(content: str) -> float:
     score += min(len(content) / 500.0, 0.15)
     return min(score, 1.0)
 
-def _execute_decay_logic() -> int:
-    """Shared decay logic used by both the API endpoint and the scheduler."""
-    decayed_count = 0
+RECENCY_HALF_LIFE_DAYS = 180.0
+
+
+def _as_utc_datetime(value, fallback: datetime) -> datetime:
+    """Coerce database/API timestamp values to a timezone-aware datetime."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            value = fallback
+    if not isinstance(value, datetime):
+        value = fallback
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def calculate_recency_strength(
+    last_accessed_at,
+    *,
+    now: datetime | None = None,
+) -> float:
+    """Return the exponential recency component shared by retrieval and decay."""
+    now = now or datetime.now(timezone.utc)
+    last_access = _as_utc_datetime(last_accessed_at, now)
+    age_days = max(0.0, (now - last_access).total_seconds() / 86400.0)
+    return math.exp(-math.log(2) * age_days / RECENCY_HALF_LIFE_DAYS)
+
+
+def calculate_decay_strength(
+    last_accessed_at,
+    importance_score: float = 0.50,
+    frequency_count: int = 1,
+    *,
+    now: datetime | None = None,
+) -> float:
+    """Return a conservative retrieval-strength multiplier in the range [0, 1].
+
+    Long-term memories are deprioritized as they become stale, but are not
+    automatically made unreachable. Importance and repeated retrieval retain
+    a durable signal while recency gradually fades with a 180-day half-life.
+    """
+    now = now or datetime.now(timezone.utc)
+    recency = calculate_recency_strength(last_accessed_at, now=now)
+    importance = min(1.0, max(0.0, float(importance_score)))
+    frequency = max(0, int(frequency_count))
+    frequency_support = min(1.0, math.log1p(frequency) / math.log1p(10))
+
+    return min(1.0, max(0.0, (0.30 * recency) + (0.45 * importance) + (0.25 * frequency_support)))
+
+
+def _execute_decay_logic(workspace_id: str | None = None) -> int:
+    """Count active memories evaluated by the ranking-only decay sweep.
+
+    Decay is calculated at retrieval time from the current access timestamp,
+    so a scheduled sweep must never deactivate ordinary long-term memories.
+    """
     conn = get_postgres_conn()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT id, importance_score, frequency_count, last_accessed_at FROM memories WHERE is_active = TRUE")
-        rows = cur.fetchall()
-        
-        now = datetime.now(timezone.utc)
-        for row in rows:
-            last_access = row['last_accessed_at']
-            if isinstance(last_access, str):
-                try:
-                    last_access = datetime.fromisoformat(last_access.replace('Z', '+00:00'))
-                except Exception:
-                    last_access = now
-            if last_access.tzinfo is None:
-                last_access = last_access.replace(tzinfo=timezone.utc)
-            
-            delta_days = (now - last_access).days
-            importance = float(row['importance_score'])
-            frequency = float(row['frequency_count'])
-            
-            # 1. Recency decay curve (half-life of 14 days)
-            recency_score = math.exp(-0.05 * delta_days)
-            
-            # 2. Frequency scaling score
-            freq_score = math.log(frequency + 1) / math.log(20 + 1)
-            
-            # 3. Overall combined weight score
-            combined_score = (0.40 * importance) + (0.35 * recency_score) + (0.25 * freq_score)
-            
-            if combined_score < 0.15:
-                cur.execute("UPDATE memories SET is_active = FALSE WHERE id = %s", (row['id'],))
-                decayed_count += 1
-    conn.commit()
+        if workspace_id is None:
+            cur.execute("SELECT count(*) AS count FROM memories WHERE is_active = TRUE")
+        else:
+            cur.execute(
+                "SELECT count(*) AS count FROM memories WHERE workspace_id = %s AND is_active = TRUE",
+                (workspace_id,),
+            )
+        row = cur.fetchone()
     conn.close()
-    return decayed_count
+    return int(row["count"] if isinstance(row, dict) else row[0])

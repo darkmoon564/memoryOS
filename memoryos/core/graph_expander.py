@@ -20,19 +20,20 @@ def expand_entities(neo4j, user_id: str, workspace_id: str, entities: list) -> d
     # 1. Multi-hop (1..3) Variable Length paths
     try:
         query_multihop = (
-            "MATCH (e:Entity {workspace_id: $workspace_id}) "
+            "MATCH (e:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
             "WHERE toLower(e.name) IN $entities_lower "
             "   OR EXISTS { "
-            "     MATCH (a:Alias)-[:ALIAS_OF]->(e) "
+            "     MATCH (a:Alias {workspace_id: $workspace_id, user_id: $user_id})-[:ALIAS_OF]->(e) "
             "     WHERE toLower(a.name) IN $entities_lower "
             "   } "
-            "MATCH p=(e)-[r:WORKS_AT|LIVES_IN|INTERESTED_IN|USES|KNOWS|RELATED_TO|OWNS|KNOWS_ABOUT|LEARNING_TOPIC|BELONGS_TO_TOPIC|HAS_PROFILE|BELONGS_TO_PROFILE|HAS_WORKFLOW|USES_TECH*1..3]->(target:Entity) "
-            "WHERE all(rel IN relationships(p) WHERE coalesce(rel.is_active, true) = true) "
+            "MATCH p=(e)-[r:WORKS_AT|LIVES_IN|INTERESTED_IN|USES|KNOWS|RELATED_TO|OWNS|PREFERS|KNOWS_ABOUT|LEARNING_TOPIC|BELONGS_TO_TOPIC|HAS_PROFILE|BELONGS_TO_PROFILE|HAS_WORKFLOW|USES_TECH*1..3]->(target:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
+            "WHERE all(rel IN relationships(p) WHERE rel.user_id = $user_id AND coalesce(rel.is_active, true) = true) "
             "UNWIND relationships(p) AS rel "
             "RETURN startNode(rel).name AS source, type(rel) AS rel, endNode(rel).name AS target"
         )
         results = neo4j.query(query_multihop, {
             "workspace_id": workspace_id,
+            "user_id": user_id,
             "entities_lower": entities_lower
         })
         for record in results:
@@ -53,14 +54,16 @@ def expand_entities(neo4j, user_id: str, workspace_id: str, entities: list) -> d
             for i in range(len(entities_lower)):
                 for j in range(i + 1, len(entities_lower)):
                     query_shortest = (
-                        "MATCH (a:Entity {workspace_id: $workspace_id}), (b:Entity {workspace_id: $workspace_id}) "
+                        "MATCH (a:Entity {workspace_id: $workspace_id, user_id: $user_id}), (b:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
                         "WHERE toLower(a.name) = $entA AND toLower(b.name) = $entB "
                         "MATCH p=shortestPath((a)-[*..4]-(b)) "
+                        "WHERE all(rel IN relationships(p) WHERE rel.user_id = $user_id AND coalesce(rel.is_active, true) = true) "
                         "UNWIND relationships(p) AS rel "
                         "RETURN startNode(rel).name AS source, type(rel) AS rel, endNode(rel).name AS target"
                     )
                     results = neo4j.query(query_shortest, {
                         "workspace_id": workspace_id,
+                        "user_id": user_id,
                         "entA": entities_lower[i],
                         "entB": entities_lower[j]
                     })
@@ -79,12 +82,16 @@ def expand_entities(neo4j, user_id: str, workspace_id: str, entities: list) -> d
     # 3. Topic/Profile community neighbor expansion
     try:
         query_neighbors = (
-            "MATCH (e:Entity {workspace_id: $workspace_id})-[:BELONGS_TO_TOPIC|BELONGS_TO_PROFILE]->(cluster:Entity)<-[:BELONGS_TO_TOPIC|BELONGS_TO_PROFILE]-(neighbor:Entity) "
-            "WHERE toLower(e.name) IN $entities_lower "
+            "MATCH (e:Entity {workspace_id: $workspace_id, user_id: $user_id})-[r1]->(cluster:Entity {workspace_id: $workspace_id, user_id: $user_id})<-[r2]-(neighbor:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
+            "WHERE type(r1) IN ['BELONGS_TO_TOPIC', 'BELONGS_TO_PROFILE'] "
+            "AND type(r2) IN ['BELONGS_TO_TOPIC', 'BELONGS_TO_PROFILE'] "
+            "AND r1.user_id = $user_id AND r2.user_id = $user_id "
+            "AND toLower(e.name) IN $entities_lower AND coalesce(r1.is_active, true) = true AND coalesce(r2.is_active, true) = true "
             "RETURN e.name AS source, cluster.name AS cluster, neighbor.name AS neighbor"
         )
         results = neo4j.query(query_neighbors, {
             "workspace_id": workspace_id,
+            "user_id": user_id,
             "entities_lower": entities_lower
         })
         for record in results:

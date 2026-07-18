@@ -8,7 +8,7 @@ import memoryos.config as config
 from memoryos.db.neo4j import close_neo4j_conn, get_neo4j_conn
 from memoryos.db.postgres import close_postgres_pool, init_postgres_pool
 from memoryos.migrations import status as migration_status
-from memoryos.services.background import drain_graph_projections
+from memoryos.services.background import drain_graph_work
 from memoryos.config import logger
 
 
@@ -43,7 +43,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _stop)
     try:
         while running:
-            completed = drain_graph_projections(args.batch_size)
+            completed = drain_graph_work(args.batch_size)
             if args.once:
                 break
             if not completed:

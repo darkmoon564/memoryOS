@@ -38,7 +38,8 @@ def test_temporal_memory_system():
         cur.execute("INSERT INTO users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (user_id,))
     conn.commit()
     
-    # 2. Ingest memories with historical timestamps
+    # 2. Ingest memories whose occurrence time is historical even though the
+    # database record is being created during this test.
     # Memory A: June 15, 2026 (Alice worked at Acme Corp.)
     # Memory B: July 10, 2026 (Alice configured docker)
     # Memory C: July 14, 2026 (Alice loves neovim) - Today!
@@ -59,7 +60,7 @@ def test_temporal_memory_system():
         # Ingest Memory A (June)
         cur.execute(
             """
-            INSERT INTO memories (id, user_id, workspace_id, content, memory_type, embedding, importance_score, frequency_count, created_at, is_active)
+            INSERT INTO memories (id, user_id, workspace_id, content, memory_type, embedding, importance_score, frequency_count, occurred_at, is_active)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (str(uuid.uuid4()), user_id, workspace_id, "Alice works at Acme Corp.", "FACTUAL", emb_str, 0.9, 1, june_date, True)
@@ -67,7 +68,7 @@ def test_temporal_memory_system():
         # Ingest Memory B (July 10)
         cur.execute(
             """
-            INSERT INTO memories (id, user_id, workspace_id, content, memory_type, embedding, importance_score, frequency_count, created_at, is_active)
+            INSERT INTO memories (id, user_id, workspace_id, content, memory_type, embedding, importance_score, frequency_count, occurred_at, is_active)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (str(uuid.uuid4()), user_id, workspace_id, "Alice configured Docker containers.", "EPISODIC", emb_str, 0.8, 1, july_mid_date, True)
@@ -75,7 +76,7 @@ def test_temporal_memory_system():
         # Ingest Memory C (Today)
         cur.execute(
             """
-            INSERT INTO memories (id, user_id, workspace_id, content, memory_type, embedding, importance_score, frequency_count, created_at, is_active)
+            INSERT INTO memories (id, user_id, workspace_id, content, memory_type, embedding, importance_score, frequency_count, occurred_at, is_active)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (str(uuid.uuid4()), user_id, workspace_id, "Alice likes neovim plugins.", "PREFERENCE", emb_str, 0.7, 1, today_date, True)
@@ -83,7 +84,7 @@ def test_temporal_memory_system():
         # Ingest Memory D (Yesterday)
         cur.execute(
             """
-            INSERT INTO memories (id, user_id, workspace_id, content, memory_type, embedding, importance_score, frequency_count, created_at, is_active)
+            INSERT INTO memories (id, user_id, workspace_id, content, memory_type, embedding, importance_score, frequency_count, occurred_at, is_active)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (str(uuid.uuid4()), user_id, workspace_id, "Alice drank green tea with ginger.", "EPISODIC", emb_str, 0.5, 1, yesterday_date, True)

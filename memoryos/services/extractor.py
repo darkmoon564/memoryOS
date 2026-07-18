@@ -105,6 +105,10 @@ def _extract_via_llm_api(content: str) -> dict | None:
     
     Returns the parsed extraction dict, or None if the LLM call fails.
     """
+    if os.getenv("OFFLINE_MODE", "false").lower() == "true":
+        # Keep test and air-gapped execution deterministic.  The caller will
+        # use the local spaCy/regex extraction path below.
+        return None
     timeout = float(os.getenv("LLM_TIMEOUT", "15.0"))
     
     # ── Mode 1: OpenAI-compatible API ──

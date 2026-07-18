@@ -15,7 +15,9 @@ from memoryos.config import logger
 from memoryos.core.scorer import _execute_decay_logic
 from memoryos.core.reflection import start_reflection_daemon
 from memoryos.db.neo4j import get_neo4j_conn
-from memoryos.services.background import drain_graph_projections
+from memoryos.models.embeddings import get_embedding_model
+from memoryos.models.reranker import get_reranker_model
+from memoryos.services.background import drain_graph_work
 from memoryos.observability import metrics, request_id
 from memoryos.migrations import status as migration_status
 import memoryos.config as config
@@ -28,7 +30,7 @@ def run_graph_projection_sweep():
     """Recover graph projections that survived a request or process failure."""
     global _projection_timer
     try:
-        completed = drain_graph_projections()
+        completed = drain_graph_work()
         if completed:
             logger.info("[Scheduler] Completed %s pending graph projections.", completed)
     except Exception:
@@ -43,8 +45,8 @@ def run_decay_sweep():
     global _decay_timer, _projection_timer
     try:
         logger.info("[Scheduler] Running automatic decay sweep...")
-        decayed = _execute_decay_logic()
-        logger.info(f"[Scheduler] Decay sweep completed. Archived {decayed} memories.")
+        evaluated = _execute_decay_logic()
+        logger.info(f"[Scheduler] Decay sweep completed. Evaluated {evaluated} active memories.")
     except Exception as e:
         logger.error(f"[Scheduler] Decay sweep failed: {e}")
     finally:
@@ -73,6 +75,11 @@ async def lifespan(app: FastAPI):
     # Force graph verification before accepting requests. In-memory graph mode is
     # only available when explicitly opted into for tests.
     get_neo4j_conn()
+
+    if os.getenv("OFFLINE_MODE", "false").lower() != "true":
+        logger.info("[Startup] Verifying semantic embedding and reranker models...")
+        get_embedding_model()
+        get_reranker_model()
 
     if os.getenv("MEMORYOS_EMBEDDED_WORKER", "false").lower() == "true":
         logger.warning("[Startup] Embedded graph worker enabled; use `python -m memoryos.worker` for production.")

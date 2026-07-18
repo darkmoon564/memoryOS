@@ -100,7 +100,7 @@ def test_planner_memory_system():
     req_dev = MemoryRetrieve(
         user_id=user_id,
         workspace_id=workspace_id,
-        query="What should I use?",
+        query="What coding preference should I use?",
         current_goal="Write a script in Python",
         limit=10
     )
@@ -123,7 +123,7 @@ def test_planner_memory_system():
     req_shop = MemoryRetrieve(
         user_id=user_id,
         workspace_id=workspace_id,
-        query="What constraints do I have?",
+        query="What budget constraint do I have?",
         current_goal="Find tools within budget",
         limit=10
     )
@@ -143,7 +143,7 @@ def test_planner_memory_system():
     req_research = MemoryRetrieve(
         user_id=user_id,
         workspace_id=workspace_id,
-        query="Tell me about programming languages.",
+        query="What factual language information do I have?",
         current_goal="Research performance metrics",
         limit=10
     )

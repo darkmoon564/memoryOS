@@ -17,7 +17,7 @@ def edit_distance(s1: str, s2: str) -> int:
         distances = distances_
     return distances[-1]
 
-def resolve_entity(name: str, workspace_id: str) -> str:
+def resolve_entity(name: str, workspace_id: str, user_id: str) -> str:
     """
     Resolves an extracted entity name to its canonical form using Neo4j database lookups
     and local string similarity metrics.
@@ -37,25 +37,25 @@ def resolve_entity(name: str, workspace_id: str) -> str:
     try:
         # 1. Exact Canonical Entity Match
         res = neo4j.query(
-            "MATCH (e:Entity {name: $name, workspace_id: $workspace_id}) RETURN e.name AS name",
-            {"name": name_clean, "workspace_id": workspace_id}
+            "MATCH (e:Entity {name: $name, workspace_id: $workspace_id, user_id: $user_id}) RETURN e.name AS name",
+            {"name": name_clean, "workspace_id": workspace_id, "user_id": user_id}
         )
         if res:
             return res[0]["name"]
             
         # 2. Exact Alias Match
         res = neo4j.query(
-            "MATCH (a:Alias {name: $name, workspace_id: $workspace_id})-[:ALIAS_OF]->(e:Entity) "
+            "MATCH (a:Alias {name: $name, workspace_id: $workspace_id, user_id: $user_id})-[:ALIAS_OF]->(e:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
             "RETURN e.name AS canonical",
-            {"name": name_clean, "workspace_id": workspace_id}
+            {"name": name_clean, "workspace_id": workspace_id, "user_id": user_id}
         )
         if res:
             return res[0]["canonical"]
             
         # 3. Fuzzy & Token Containment Matches
         all_entities = neo4j.query(
-            "MATCH (e:Entity {workspace_id: $workspace_id}) RETURN e.name AS name",
-            {"workspace_id": workspace_id}
+            "MATCH (e:Entity {workspace_id: $workspace_id, user_id: $user_id}) RETURN e.name AS name",
+            {"workspace_id": workspace_id, "user_id": user_id}
         )
         existing_names = [r["name"] for r in all_entities]
         

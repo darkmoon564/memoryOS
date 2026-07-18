@@ -7,6 +7,10 @@ from memoryos.config import logger
 
 def query_llm(system_prompt: str, user_prompt: str) -> str | None:
     """Utility to query the configured LLM (OpenAI-compatible or Ollama)."""
+    if os.getenv("OFFLINE_MODE", "false").lower() == "true":
+        # Deterministic test mode must not make an accidental network call to
+        # a developer's Ollama or OpenAI-compatible endpoint.
+        return None
     timeout = float(os.getenv("LLM_TIMEOUT", "15.0"))
     
     # ── Mode 1: OpenAI-compatible API ──
@@ -92,28 +96,67 @@ def generate_episode_summary(transcript: str) -> str:
     return f"Interaction including: {lines[0].lstrip('- ')} And: {lines[-1].lstrip('- ')}"
 
 
-def process_conversation_log(conn, user_id: str, session_id: str, workspace_id: str, content: str, embedding_model) -> str:
+def process_conversation_log(
+    conn,
+    user_id: str,
+    session_id: str,
+    workspace_id: str,
+    content: str,
+    embedding_model,
+    occurred_at: datetime | None = None,
+    source_event_id: str | None = None,
+) -> str:
     """
     Ingests a raw conversation log, groups it into a temporal Episode,
     summarizes the episode's history, and embeddings the summary.
     Returns the episode_id.
     """
-    now = datetime.now(timezone.utc)
+    interaction_time = occurred_at or datetime.now(timezone.utc)
+    if interaction_time.tzinfo is None:
+        interaction_time = interaction_time.replace(tzinfo=timezone.utc)
     log_id = str(uuid.uuid4())
     
     with conn.cursor() as cur:
-        # 1. Insert the raw conversation log record
-        cur.execute(
-            """
-            INSERT INTO conversation_logs (id, user_id, session_id, workspace_id, content, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """,
-            (log_id, user_id, session_id, workspace_id, content, now)
-        )
+        # A stable upstream turn identifier makes retries safe for the raw
+        # transcript as well as for canonical memory rows.  Older callers
+        # without one keep the historical append-only behavior.
+        existing_log = None
+        existing_episode_id = None
+        if source_event_id:
+            cur.execute(
+                """
+                SELECT id, episode_id
+                FROM conversation_logs
+                WHERE user_id = %s AND workspace_id = %s AND source_event_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_id, workspace_id, source_event_id),
+            )
+            existing_log = cur.fetchone()
+            if existing_log:
+                log_id = str(existing_log[0] if not isinstance(existing_log, dict) else existing_log["id"])
+                existing_episode_id = existing_log[1] if not isinstance(existing_log, dict) else existing_log["episode_id"]
+
+        # 1. Insert the raw conversation log record unless this source turn
+        # was already persisted.  The database index is the concurrent-write
+        # safeguard; this lookup preserves a successful retry's episode id.
+        if existing_episode_id:
+            return str(existing_episode_id)
+        if not existing_log:
+            cur.execute(
+                """
+                INSERT INTO conversation_logs
+                    (id, user_id, session_id, workspace_id, content, source_event_id, occurred_at, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (log_id, user_id, session_id, workspace_id, content, source_event_id, interaction_time, interaction_time)
+            )
         
         # 2. Check for an active Episode within the time threshold (default 10 minutes)
         gap_limit = int(os.getenv("EPISODE_GAP_SECONDS", "600"))
-        threshold = now - timedelta(seconds=gap_limit)
+        threshold = interaction_time - timedelta(seconds=gap_limit)
+        upper_bound = interaction_time + timedelta(seconds=gap_limit)
         
         # Check if SQLite (tuple) vs Postgres (dict) structure
         cur.execute(
@@ -122,9 +165,10 @@ def process_conversation_log(conn, user_id: str, session_id: str, workspace_id: 
             WHERE user_id = %s AND workspace_id = %s 
             AND (session_id = %s OR (session_id IS NULL AND %s IS NULL))
             AND last_interaction_at >= %s
+            AND last_interaction_at <= %s
             ORDER BY last_interaction_at DESC LIMIT 1
             """,
-            (user_id, workspace_id, session_id, session_id, threshold)
+                (user_id, workspace_id, session_id, session_id, threshold, upper_bound)
         )
         row = cur.fetchone()
         
@@ -133,8 +177,15 @@ def process_conversation_log(conn, user_id: str, session_id: str, workspace_id: 
             episode_id = str(row[0]) if not isinstance(row, dict) else str(row["id"])
             # Update last interaction timestamp
             cur.execute(
-                "UPDATE episodes SET last_interaction_at = %s WHERE id = %s",
-                (now, episode_id)
+                """
+                UPDATE episodes
+                SET last_interaction_at = CASE
+                    WHEN last_interaction_at > %s THEN last_interaction_at
+                    ELSE %s
+                END
+                WHERE id = %s
+                """,
+                (interaction_time, interaction_time, episode_id)
             )
         else:
             # Create a new episode
@@ -144,7 +195,7 @@ def process_conversation_log(conn, user_id: str, session_id: str, workspace_id: 
                 INSERT INTO episodes (id, user_id, session_id, workspace_id, summary, last_interaction_at, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
-                (episode_id, user_id, session_id, workspace_id, "New interaction.", now, now)
+                (episode_id, user_id, session_id, workspace_id, "New interaction.", interaction_time, interaction_time)
             )
             
         # 3. Link the new conversation log to this episode
@@ -155,7 +206,7 @@ def process_conversation_log(conn, user_id: str, session_id: str, workspace_id: 
         
         # 4. Fetch all logs linked to this episode to build/rebuild the summary
         cur.execute(
-            "SELECT content FROM conversation_logs WHERE episode_id = %s ORDER BY created_at ASC",
+            "SELECT content FROM conversation_logs WHERE episode_id = %s ORDER BY occurred_at ASC, created_at ASC",
             (episode_id,)
         )
         log_rows = cur.fetchall()

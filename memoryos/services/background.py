@@ -14,7 +14,7 @@ from memoryos.db.postgres import get_postgres_conn
 from memoryos.observability import metrics
 
 ALLOWED_RELATIONSHIPS = {
-    "WORKS_AT", "LIVES_IN", "INTERESTED_IN", "USES", "KNOWS", "OWNS",
+    "WORKS_AT", "LIVES_IN", "INTERESTED_IN", "USES", "KNOWS", "OWNS", "PREFERS",
     "LEARNING_TOPIC", "BELONGS_TO_TOPIC", "HAS_PROFILE", "BELONGS_TO_PROFILE",
     "HAS_WORKFLOW", "USES_TECH", "KNOWS_ABOUT", "SUPERSEDED_BY"
 }
@@ -212,6 +212,151 @@ def drain_graph_projections(limit: int = 100) -> int:
             completed += 1
     return completed
 
+
+def _delete_user_graph_data(user_id: str, workspace_id: str, memory_ids: list[str]) -> None:
+    """Remove one user's derived graph state without touching other users."""
+    neo4j = get_neo4j_conn()
+    if not neo4j:
+        raise ConnectionError("Neo4j connector not initialized or unavailable.")
+
+    if getattr(neo4j, "is_mock", False):
+        from memoryos.config import _mock_graph_data
+
+        _mock_graph_data["users"].pop(user_id, None)
+        _mock_graph_data["relationships"] = [
+            relationship
+            for relationship in _mock_graph_data["relationships"]
+            if not (
+                relationship.get("workspace_id") == workspace_id
+                and (
+                    relationship.get("source") == user_id
+                    or relationship.get("user_id") == user_id
+                    or relationship.get("source_memory_id") in memory_ids
+                )
+            )
+        ]
+        _mock_graph_data["entities"] = {
+            name: entity
+            for name, entity in _mock_graph_data["entities"].items()
+            if not (
+                entity.get("workspace") == workspace_id
+                and entity.get("user_id") == user_id
+            )
+        }
+        return
+
+    neo4j.query(
+        "MATCH (u:User {id: $user_id, workspace_id: $workspace_id}) DETACH DELETE u",
+        {"user_id": user_id, "workspace_id": workspace_id},
+    )
+    neo4j.query(
+        "MATCH ()-[r]->() "
+        "WHERE r.workspace_id = $workspace_id "
+        "AND (r.user_id = $user_id OR r.source_memory_id IN $memory_ids) "
+        "DELETE r",
+        {
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "memory_ids": memory_ids,
+        },
+    )
+    neo4j.query(
+        "MATCH (n {user_id: $user_id, workspace_id: $workspace_id}) DETACH DELETE n",
+        {"user_id": user_id, "workspace_id": workspace_id},
+    )
+
+
+def process_graph_deletion(deletion_id: str) -> bool:
+    """Claim and execute one durable user-graph deletion request."""
+    conn = get_postgres_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE graph_deletion_outbox
+                SET status = 'PROCESSING', attempts = attempts + 1, error_message = NULL,
+                    locked_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND (
+                    (status IN ('PENDING', 'RETRY') AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP))
+                    OR (status = 'PROCESSING' AND locked_at < %s)
+                )
+                RETURNING user_id, workspace_id, memory_ids, attempts
+                """,
+                (deletion_id, datetime.now(timezone.utc) - timedelta(seconds=GRAPH_PROJECTION_LEASE_SECONDS)),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return False
+
+        row_data = dict(row)
+        memory_ids = row_data["memory_ids"]
+        if isinstance(memory_ids, str):
+            memory_ids = json.loads(memory_ids)
+
+        try:
+            _delete_user_graph_data(row_data["user_id"], row_data["workspace_id"], memory_ids)
+        except Exception as exc:
+            error_message = str(exc)
+            retry_delay = min(GRAPH_PROJECTION_MAX_BACKOFF_SECONDS, 2 ** row_data["attempts"])
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE graph_deletion_outbox
+                    SET status = 'RETRY', error_message = %s, next_attempt_at = %s, locked_at = NULL
+                    WHERE id = %s
+                    """,
+                    (error_message, datetime.now(timezone.utc) + timedelta(seconds=retry_delay), deletion_id),
+                )
+            conn.commit()
+            logger.exception("[Graph Deletion] Cleanup %s failed and will be retried", deletion_id)
+            metrics.increment("memoryos_graph_deletions_total", {"outcome": "retry"})
+            return False
+
+        with conn.cursor() as cur:
+            # A successful erasure request contains no memory content, and is
+            # removed rather than retained as another user-data record.
+            cur.execute("DELETE FROM graph_deletion_outbox WHERE id = %s", (deletion_id,))
+        conn.commit()
+        metrics.increment("memoryos_graph_deletions_total", {"outcome": "completed"})
+        return True
+    finally:
+        conn.close()
+
+
+def drain_graph_deletions(limit: int = 100) -> int:
+    """Recover pending user-graph erasures after a worker or Neo4j outage."""
+    conn = get_postgres_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM graph_deletion_outbox
+                WHERE (status IN ('PENDING', 'RETRY') AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP))
+                   OR (status = 'PROCESSING' AND locked_at < %s)
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                (datetime.now(timezone.utc) - timedelta(seconds=GRAPH_PROJECTION_LEASE_SECONDS), limit),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    completed = 0
+    for row in rows:
+        deletion_id = row["id"] if isinstance(row, dict) else row[0]
+        if process_graph_deletion(str(deletion_id)):
+            completed += 1
+    return completed
+
+
+def drain_graph_work(limit: int = 100) -> int:
+    """Drain both graph projections and durable user-data erasures."""
+    completed_projections = drain_graph_projections(limit)
+    completed_deletions = drain_graph_deletions(limit)
+    return completed_projections + completed_deletions
+
 def _execute_graph_inserts(memory_id: str, user_id: str, workspace_id: str, graph_data: dict):
     """Executes the raw Cypher query database modifications on Neo4j."""
     neo4j = get_neo4j_conn()
@@ -225,15 +370,15 @@ def _execute_graph_inserts(memory_id: str, user_id: str, workspace_id: str, grap
     resolved_map = {}
     for entity in entities:
         raw_name = entity["name"]
-        resolved_map[raw_name] = resolve_entity(raw_name, workspace_id)
+        resolved_map[raw_name] = resolve_entity(raw_name, workspace_id, user_id)
         
     for rel in relationships:
         src = rel["source"]
         tgt = rel["target"]
         if src not in resolved_map:
-            resolved_map[src] = resolve_entity(src, workspace_id)
+            resolved_map[src] = resolve_entity(src, workspace_id, user_id)
         if tgt not in resolved_map:
-            resolved_map[tgt] = resolve_entity(tgt, workspace_id)
+            resolved_map[tgt] = resolve_entity(tgt, workspace_id, user_id)
             
     # Insert User Node
     user_query = "MERGE (u:User {id: $user_id, workspace_id: $workspace_id})"
@@ -248,39 +393,42 @@ def _execute_graph_inserts(memory_id: str, user_id: str, workspace_id: str, grap
                 break
                 
         ent_query = """
-            MERGE (e:Entity {name: $name, workspace_id: $workspace_id})
+            MERGE (e:Entity {name: $name, workspace_id: $workspace_id, user_id: $user_id})
             SET e.type = $type
         """
         neo4j.query(ent_query, {
             "name": canonical_name,
             "type": ent_type,
-            "workspace_id": workspace_id
+            "workspace_id": workspace_id,
+            "user_id": user_id,
         })
         
         if raw_name != canonical_name:
-            alias_query = "MERGE (a:Alias {name: $alias_name, workspace_id: $workspace_id})"
-            neo4j.query(alias_query, {"alias_name": raw_name, "workspace_id": workspace_id})
+            alias_query = "MERGE (a:Alias {name: $alias_name, workspace_id: $workspace_id, user_id: $user_id})"
+            neo4j.query(alias_query, {"alias_name": raw_name, "workspace_id": workspace_id, "user_id": user_id})
             
             alias_rel_query = """
-                MATCH (a:Alias {name: $alias_name, workspace_id: $workspace_id})
-                MATCH (e:Entity {name: $canonical_name, workspace_id: $workspace_id})
+                MATCH (a:Alias {name: $alias_name, workspace_id: $workspace_id, user_id: $user_id})
+                MATCH (e:Entity {name: $canonical_name, workspace_id: $workspace_id, user_id: $user_id})
                 MERGE (a)-[r:ALIAS_OF]->(e)
             """
             neo4j.query(alias_rel_query, {
                 "alias_name": raw_name,
                 "canonical_name": canonical_name,
-                "workspace_id": workspace_id
+                "workspace_id": workspace_id,
+                "user_id": user_id,
             })
             
         user_ent_query = """
             MATCH (u:User {id: $user_id, workspace_id: $workspace_id})
-            MATCH (e:Entity {name: $name, workspace_id: $workspace_id})
-            MERGE (u)-[r:KNOWS_ABOUT]->(e)
+            MATCH (e:Entity {name: $name, workspace_id: $workspace_id, user_id: $user_id})
+            MERGE (u)-[r:KNOWS_ABOUT {user_id: $user_id}]->(e)
+            SET r.workspace_id = $workspace_id, r.is_active = true
         """
         neo4j.query(user_ent_query, {
             "user_id": user_id,
             "name": canonical_name,
-            "workspace_id": workspace_id
+            "workspace_id": workspace_id,
         })
         
     resolved_rels = []
@@ -297,16 +445,23 @@ def _execute_graph_inserts(memory_id: str, user_id: str, workspace_id: str, grap
         
     resolve_contradictions(user_id, workspace_id, resolved_rels, neo4j)
     
-    timestamp_str = datetime.now(timezone.utc).isoformat()
+    occurred_at = graph_data.get("occurred_at")
+    if isinstance(occurred_at, str):
+        try:
+            timestamp_str = datetime.fromisoformat(occurred_at.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+        except ValueError:
+            timestamp_str = datetime.now(timezone.utc).isoformat()
+    else:
+        timestamp_str = datetime.now(timezone.utc).isoformat()
     for rel in resolved_rels:
         rel_type = sanitize_relationship_type(rel["type"])
         if not rel_type:
             continue
             
         rel_query = f"""
-            MATCH (s:Entity {{name: $source, workspace_id: $workspace_id}})
-            MATCH (t:Entity {{name: $target, workspace_id: $workspace_id}})
-            MERGE (s)-[r:{rel_type}]->(t)
+            MATCH (s:Entity {{name: $source, workspace_id: $workspace_id, user_id: $user_id}})
+            MATCH (t:Entity {{name: $target, workspace_id: $workspace_id, user_id: $user_id}})
+            MERGE (s)-[r:{rel_type} {{user_id: $user_id}}]->(t)
             ON CREATE SET 
                 r.version = 1,
                 r.evidence_count = 1,
@@ -332,6 +487,7 @@ def _execute_graph_inserts(memory_id: str, user_id: str, workspace_id: str, grap
             "source": rel["source"],
             "target": rel["target"],
             "workspace_id": workspace_id,
+            "user_id": user_id,
             "source_memory_id": memory_id,
             "timestamp": timestamp_str,
             "confidence": float(rel.get("confidence", 0.9))

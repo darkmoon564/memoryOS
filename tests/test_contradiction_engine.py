@@ -136,6 +136,28 @@ def test_contradiction_engine():
         assert ss_row["relationship_type"] == "LIVES_IN"
         assert ss_row["subject"] == "alice"
         assert ss_row["timestamp"] is not None
+
+    # Tool use is multi-valued.  A new tool must add evidence rather than
+    # turn an older, still true tool-memory into a superseded fact.
+    print("\nStep 3: Ingesting two independently active tools...")
+    background_graph_ingest("m3", "Alice uses Neovim.", user_id, workspace_id)
+    background_graph_ingest("m4", "Alice uses Docker.", user_id, workspace_id)
+    if is_mock:
+        uses_rels = [
+            rel for rel in _mock_graph_data["relationships"]
+            if rel["type"] == "USES" and rel["source"] == "alice"
+        ]
+        assert {rel["target"] for rel in uses_rels} == {"neovim", "docker"}
+        assert all(rel["is_active"] is True for rel in uses_rels)
+    else:
+        uses_rels = neo4j.query(
+            "MATCH (:Entity {name: 'alice', workspace_id: $workspace_id, user_id: $user_id})"
+            "-[r:USES {user_id: $user_id}]->(tool:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
+            "RETURN tool.name AS tool, r.is_active AS is_active",
+            {"workspace_id": workspace_id, "user_id": user_id},
+        )
+        assert {row["tool"] for row in uses_rels} == {"neovim", "docker"}
+        assert all(row["is_active"] is True for row in uses_rels)
         
     print("\n" + "=" * 60)
     print("  Contradiction Engine tests completed successfully!")
