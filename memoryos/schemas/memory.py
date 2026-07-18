@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, validator
 from typing import List, Optional
 
@@ -13,6 +14,8 @@ class MemoryIngest(BaseModel):
     content: str = Field(..., description="The factual text to ingest")
     workspace_id: str = Field("default", description="Workspace separation parameter")
     session_id: Optional[str] = Field(None, description="Optional active session ID")
+    occurred_at: Optional[datetime] = Field(None, description="Timezone-aware time when this event occurred")
+    source_event_id: Optional[str] = Field(None, description="Optional stable identifier of the originating turn or event")
 
     @validator("user_id", "workspace_id")
     def check_ids(cls, v):
@@ -20,9 +23,28 @@ class MemoryIngest(BaseModel):
 
     @validator("content")
     def check_content_length(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Memory content must not be empty.")
         if len(v) > 10000:
             raise ValueError("Memory content size exceeds maximum limit of 10000 characters.")
-        return v
+        return v.strip()
+
+    @validator("occurred_at")
+    def check_occurred_at(cls, v):
+        if v is not None and v.tzinfo is None:
+            raise ValueError("occurred_at must include a timezone offset.")
+        return v.astimezone(timezone.utc) if v is not None else v
+
+    @validator("source_event_id")
+    def check_source_event_id(cls, v):
+        if v is None:
+            return v
+        value = v.strip()
+        if not value:
+            raise ValueError("source_event_id must not be blank.")
+        if len(value) > 256 or "\x00" in value:
+            raise ValueError("source_event_id must be at most 256 characters and contain no null bytes.")
+        return value
 
 class MemoryRetrieve(BaseModel):
     user_id: str = Field(..., description="ID of the user")
@@ -37,9 +59,11 @@ class MemoryRetrieve(BaseModel):
 
     @validator("query")
     def check_query_length(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Query must not be empty.")
         if len(v) > 1000:
             raise ValueError("Query size exceeds maximum limit of 1000 characters.")
-        return v
+        return v.strip()
 
 class IngestResponse(BaseModel):
     status: str
@@ -52,6 +76,8 @@ class MemoryItem(BaseModel):
     score: float
     type: str
     created_at: str
+    occurred_at: Optional[str] = None
+    source_event_ids: List[str] = Field(default_factory=list)
     confidence: Optional[float] = 0.5
     importance: Optional[float] = 0.5
     frequency: Optional[int] = 1

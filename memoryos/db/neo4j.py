@@ -43,8 +43,11 @@ class MockNeo4jDriver:
         if "MATCH (e:Entity {name: $name" in query_string:
             name = parameters.get("name")
             workspace_id = parameters.get("workspace_id")
+            user_id = parameters.get("user_id")
             for ent_name, info in self.data["entities"].items():
-                if ent_name == name and info.get("workspace") == workspace_id:
+                if ent_name == name and info.get("workspace") == workspace_id and (
+                    user_id is None or info.get("user_id") in {None, user_id}
+                ):
                     return [{"name": ent_name}]
             return []
             
@@ -56,11 +59,17 @@ class MockNeo4jDriver:
                 return [{"canonical": canonical}]
             return []
             
-        elif "MATCH (e:Entity {workspace_id: $workspace_id}) RETURN e.name" in query_string:
+        elif (
+            "MATCH (e:Entity {workspace_id: $workspace_id" in query_string
+            and "RETURN e.name AS name" in query_string
+        ):
             workspace_id = parameters.get("workspace_id")
+            user_id = parameters.get("user_id")
             results = []
             for ent_name, info in self.data["entities"].items():
-                if info.get("workspace") == workspace_id:
+                if info.get("workspace") == workspace_id and (
+                    user_id is None or info.get("user_id") in {None, user_id}
+                ):
                     results.append({"name": ent_name})
             return results
             
@@ -127,7 +136,11 @@ class MockNeo4jDriver:
                     ent_type = "Episode"
                 else:
                     ent_type = "Entity"
-            self.data["entities"][name] = {"type": ent_type, "workspace": parameters.get("workspace_id")}
+            self.data["entities"][name] = {
+                "type": ent_type,
+                "workspace": parameters.get("workspace_id"),
+                "user_id": parameters.get("user_id"),
+            }
             
         elif "MERGE (w:Workflow" in query_string:
             name = parameters.get("name")
@@ -182,7 +195,7 @@ class MockNeo4jDriver:
             workspace_id = parameters.get("workspace_id")
             
             rel_type = "RELATED_TO"
-            for r_type in ["WORKS_AT", "INTERESTED_IN", "USES", "LIVES_IN", "KNOWS", "RELATED_TO", "KNOWS_ABOUT", "LEARNING_TOPIC", "BELONGS_TO_TOPIC", "HAS_PROFILE", "BELONGS_TO_PROFILE", "HAS_WORKFLOW", "USES_TECH", "SUPERSEDED_BY"]:
+            for r_type in ["WORKS_AT", "INTERESTED_IN", "USES", "LIVES_IN", "KNOWS", "PREFERS", "RELATED_TO", "KNOWS_ABOUT", "LEARNING_TOPIC", "BELONGS_TO_TOPIC", "HAS_PROFILE", "BELONGS_TO_PROFILE", "HAS_WORKFLOW", "USES_TECH", "SUPERSEDED_BY"]:
                 if f":{r_type}" in query_string or f"r:{r_type}" in query_string or r_type in query_string:
                     rel_type = r_type
                     break
@@ -216,6 +229,7 @@ class MockNeo4jDriver:
                     "timestamp": timestamp,
                     "confidence": confidence,
                     "workspace_id": workspace_id,
+                    "user_id": parameters.get("user_id"),
                     "version": 1,
                     "evidence_count": 1,
                     "valid_from": timestamp,
@@ -555,6 +569,13 @@ class MockNeo4jDriver:
 
 class Neo4jConnector:
     """Manages connections and queries to local Neo4j or falls back to Mock Graph database."""
+    _SCHEMA_QUERIES = (
+        "CREATE INDEX memoryos_user_scope IF NOT EXISTS FOR (u:User) ON (u.workspace_id, u.id)",
+        "CREATE INDEX memoryos_entity_scope_name IF NOT EXISTS FOR (e:Entity) ON (e.workspace_id, e.user_id, e.name)",
+        "CREATE INDEX memoryos_alias_scope_name IF NOT EXISTS FOR (a:Alias) ON (a.workspace_id, a.user_id, a.name)",
+        "CREATE INDEX memoryos_workflow_scope_name IF NOT EXISTS FOR (w:Workflow) ON (w.workspace_id, w.user_id, w.name)",
+    )
+
     def __init__(self):
         import memoryos.config as config
         if config._use_neo4j_fallback:
@@ -569,6 +590,8 @@ class Neo4jConnector:
             self._driver = GraphDatabase.driver(uri, auth=(user, password))
             with self._driver.session() as s:
                 s.run("RETURN 1")
+                for schema_query in self._SCHEMA_QUERIES:
+                    s.run(schema_query).consume()
             self.is_mock = False
             config._use_neo4j_fallback = False
         except Exception as e:

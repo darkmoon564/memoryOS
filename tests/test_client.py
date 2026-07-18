@@ -219,7 +219,7 @@ def run_tests():
     print("\n--- Test 8: Decay Engine ---")
     
     async def run_decay():
-        return await apply_decay()
+        return await apply_decay(workspace_id="default")
     
     decay_result = loop.run_until_complete(run_decay())
     print(f"  Decay result: {decay_result}")
@@ -239,3 +239,4 @@ if __name__ == "__main__":
             import traceback
             print(f"\n[ERROR] Test run failed: {e}")
             traceback.print_exc()
+            sys.exit(1)

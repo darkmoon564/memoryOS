@@ -25,6 +25,10 @@ class MemoryIngestionService:
     
     @staticmethod
     async def ingest(data: MemoryIngest, background_tasks: Optional[BackgroundTasks] = None) -> IngestResponse:
+        occurred_at = data.occurred_at or datetime.now(timezone.utc)
+        if occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+        occurred_at = occurred_at.astimezone(timezone.utc)
         try:
             events = parse_events(data.content)
         except Exception as e:
@@ -69,12 +73,16 @@ class MemoryIngestionService:
                 "memory_type": memory_type,
                 "importance": importance,
                 "entities": clause_entities,
-                "relationships": clause_relationships
+                "relationships": clause_relationships,
+                "occurred_at": occurred_at.isoformat(),
+                "source_event_id": data.source_event_id,
             })
             
         event_payload = {
             "raw_text": data.content,
             "session_id": data.session_id,
+            "occurred_at": occurred_at.isoformat(),
+            "source_event_id": data.source_event_id,
             "clauses": clauses_payload,
             "entities": all_entities,
             "relationships": all_relationships,
@@ -94,8 +102,8 @@ class MemoryIngestionService:
                 cur.execute("INSERT INTO users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (data.user_id,))
                 if data.session_id:
                     cur.execute(
-                        "INSERT INTO sessions (id, user_id) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING",
-                        (data.session_id, data.user_id)
+                        "INSERT INTO sessions (id, user_id, started_at) VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                        (data.session_id, data.user_id, occurred_at)
                     )
                 
                 # Build temporal episodes
@@ -106,7 +114,9 @@ class MemoryIngestionService:
                         data.session_id,
                         data.workspace_id,
                         data.content,
-                        model
+                        model,
+                        occurred_at=occurred_at,
+                        source_event_id=data.source_event_id,
                     )
                 except Exception as ep_err:
                     logger.error(f"Episode builder/logging failed: {ep_err}")
@@ -125,6 +135,7 @@ class MemoryIngestionService:
                     
                     existing_memory_id = None
                     frequency_updated = False
+                    source_is_new = True
                     
                     cur.execute(
                         "SELECT id FROM memories WHERE user_id = %s AND workspace_id = %s AND fingerprint = %s AND is_active = TRUE",
@@ -133,31 +144,62 @@ class MemoryIngestionService:
                     row = cur.fetchone()
                     if row:
                         existing_memory_id = str(row[0]) if not isinstance(row, dict) else str(row['id'])
-                        cur.execute(
-                            "UPDATE memories SET frequency_count = frequency_count + 1, last_accessed_at = CURRENT_TIMESTAMP WHERE id = %s",
-                            (existing_memory_id,)
-                        )
+                        if data.source_event_id:
+                            cur.execute(
+                                "SELECT 1 FROM memory_sources WHERE memory_id = %s AND source_event_id = %s",
+                                (existing_memory_id, data.source_event_id),
+                            )
+                            source_is_new = cur.fetchone() is None
+                        if source_is_new:
+                            cur.execute(
+                                """
+                                UPDATE memories
+                                SET frequency_count = frequency_count + 1,
+                                    last_accessed_at = CURRENT_TIMESTAMP,
+                                    occurred_at = CASE WHEN occurred_at < %s THEN %s ELSE occurred_at END
+                                WHERE id = %s
+                                """,
+                                (occurred_at, occurred_at, existing_memory_id),
+                            )
                         frequency_updated = True
                     else:
                         cur.execute(
                             """
-                            INSERT INTO memories (id, user_id, session_id, workspace_id, content, embedding, memory_type, importance_score, fingerprint)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            INSERT INTO memories
+                                (id, user_id, session_id, workspace_id, content, embedding, memory_type, importance_score, fingerprint, occurred_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             """,
-                            (evt_id, data.user_id, data.session_id, data.workspace_id, evt, embedding, memory_type, importance, fingerprint)
+                            (evt_id, data.user_id, data.session_id, data.workspace_id, evt, embedding, memory_type, importance, fingerprint, occurred_at)
                         )
                     
                     target_memory_id = existing_memory_id if frequency_updated else evt_id
-                    clause_graph = {"entities": item["entities"], "relationships": item["relationships"]}
-                    projection_id = str(uuid.uuid4())
-                    cur.execute(
-                        """
-                        INSERT INTO graph_projection_outbox
-                            (id, memory_id, user_id, workspace_id, content, graph_payload)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        """,
-                        (projection_id, target_memory_id, data.user_id, data.workspace_id, evt, json.dumps(clause_graph)),
-                    )
+                    if data.source_event_id and source_is_new:
+                        cur.execute(
+                            """
+                            INSERT INTO memory_sources (memory_id, source_event_id, occurred_at)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (memory_id, source_event_id)
+                            DO UPDATE SET occurred_at = EXCLUDED.occurred_at
+                            """,
+                            (target_memory_id, data.source_event_id, occurred_at),
+                        )
+                    clause_graph = {
+                        "entities": item["entities"],
+                        "relationships": item["relationships"],
+                        "occurred_at": occurred_at.isoformat(),
+                        "source_event_id": data.source_event_id,
+                    }
+                    projection_id = None
+                    if source_is_new or not data.source_event_id:
+                        projection_id = str(uuid.uuid4())
+                        cur.execute(
+                            """
+                            INSERT INTO graph_projection_outbox
+                                (id, memory_id, user_id, workspace_id, content, graph_payload)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            """,
+                            (projection_id, target_memory_id, data.user_id, data.workspace_id, evt, json.dumps(clause_graph)),
+                        )
                     ingested_memory_ids.append((target_memory_id, evt, embedding, memory_type, frequency_updated, projection_id))
 
                 # The event becomes visible only with the records it describes.
@@ -182,12 +224,12 @@ class MemoryIngestionService:
         # 3. Graph Ingestion
         process_in_api = os.getenv("MEMORYOS_PROCESS_OUTBOX_INLINE", "false").lower() == "true"
         for target_memory_id, evt, embedding, memory_type, frequency_updated, projection_id in ingested_memory_ids:
-            if process_in_api and background_tasks:
+            if projection_id and process_in_api and background_tasks:
                 background_tasks.add_task(
                     process_graph_projection,
                     projection_id,
                 )
-            elif process_in_api:
+            elif projection_id and process_in_api:
                 # CLI and replay callers synchronously drain the durable item.
                 process_graph_projection(projection_id)
                 

@@ -1,143 +1,106 @@
+"""HTTP route smoke test using FastAPI's in-process test client.
+
+Keeping the client in the same process means the explicit SQLite test adapter
+and seeded test key are shared. Production CI runs the identical HTTP routes
+against its real Postgres and Neo4j services.
+"""
+
 import os
 import sys
-import time
-import subprocess
-import requests
 
-# Ensure package is in path
+from fastapi.testclient import TestClient
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from memoryos.db.postgres import get_postgres_conn
+from memoryos.main import app
 from memoryos.security import hash_api_key
 
-def test_api_endpoints():
-    print("=" * 60)
-    print("  Testing MemoryOS REST API Endpoints Local Startup")
-    print("=" * 60)
 
-    # Seed API key for the test
-    print("Seeding test API key...")
+WORKSPACE_ID = "api_test"
+API_KEY = "test_api_server_key"
+USER_ID = "api_test_user"
+
+
+def seed_api_key() -> None:
+    conn = get_postgres_conn()
     try:
-        conn = get_postgres_conn()
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM api_keys WHERE key_hash = %s", (hash_api_key("test_api_server_key"),))
-            cur.execute("INSERT INTO api_keys (key_hash, workspace_id, description) VALUES (%s, %s, %s)", (hash_api_key("test_api_server_key"), "api_test", "Test Key for API server checks"))
+            cur.execute("DELETE FROM api_keys WHERE key_hash = %s", (hash_api_key(API_KEY),))
+            cur.execute(
+                "INSERT INTO api_keys (key_hash, workspace_id, description) VALUES (%s, %s, %s)",
+                (hash_api_key(API_KEY), WORKSPACE_ID, "HTTP route smoke-test key"),
+            )
         conn.commit()
+    finally:
         conn.close()
-    except Exception as seed_err:
-        print(f"[ERROR] Failed to seed API key: {seed_err}")
-        sys.exit(1)
 
-    # 1. Start the uvicorn server as a subprocess
-    cmd = [
-        sys.executable,
-        "-m", "uvicorn",
-        "memoryos.main:app",
-        "--host", "127.0.0.1",
-        "--port", "8088"
-    ]
 
-    print("Starting FastAPI Uvicorn Server in OFFLINE_MODE...")
-    env = os.environ.copy()
-    env["OFFLINE_MODE"] = "true"
-    process = subprocess.Popen(
-        cmd,
-        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
-        env=env,
-        text=True
-    )
+def cleanup() -> None:
+    conn = get_postgres_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM memories WHERE user_id = %s AND workspace_id = %s", (USER_ID, WORKSPACE_ID))
+            cur.execute("DELETE FROM api_keys WHERE key_hash = %s", (hash_api_key(API_KEY),))
+        conn.commit()
+    finally:
+        conn.close()
 
-    # Wait for the server to bind
-    print("Waiting 3 seconds for database initialization...")
-    time.sleep(3.0)
 
-    if process.poll() is not None:
-        print(f"[ERROR] Server failed to start. Code: {process.returncode}")
-        # Clean up
-        try:
-            conn = get_postgres_conn()
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM api_keys WHERE key_hash = %s", (hash_api_key("test_api_server_key"),))
-            conn.commit()
-            conn.close()
-        except:
-            pass
-        sys.exit(1)
-
-    print("[PASS] Uvicorn server started successfully in background.")
-
-    # Server Base URL
-    base_url = "http://127.0.0.1:8088"
-    user_id = "api_test_user"
-    headers = {"Authorization": "Bearer test_api_server_key"}
+def test_api_endpoints() -> None:
+    print("=" * 60)
+    print("  Testing MemoryOS HTTP Routes")
+    print("=" * 60)
+    seed_api_key()
+    headers = {"Authorization": f"Bearer {API_KEY}"}
 
     try:
-        # 2. Test Ingestion endpoint
-        print("\nSending Memory Ingest request to /v1/memories...")
-        ingest_payload = {
-            "user_id": user_id,
-            "content": "Dave prefers dark mode and codes primarily in Python.",
-            "workspace_id": "api_test"
-        }
-        res = requests.post(f"{base_url}/v1/memories", json=ingest_payload, headers=headers, timeout=30.0)
-        print(f"Status Code: {res.status_code}")
-        print(f"Response: {res.json()}")
-        assert res.status_code == 200, "Ingestion should return HTTP 200"
+        # TestClient waits for the application lifespan to complete, proving
+        # readiness rather than assuming a fixed startup sleep is sufficient.
+        with TestClient(app) as client:
+            health = client.get("/health")
+            assert health.status_code == 200, health.text
 
-        # 3. Test Retrieval endpoint
-        print("\nSending Memory Retrieval request to /v1/memories/retrieve...")
-        retrieve_payload = {
-            "user_id": user_id,
-            "query": "What preferences does Dave have?",
-            "limit": 3,
-            "workspace_id": "api_test"
-        }
-        res = requests.post(f"{base_url}/v1/memories/retrieve", json=retrieve_payload, headers=headers, timeout=30.0)
-        print(f"Status Code: {res.status_code}")
-        print(f"Response: {res.json()}")
-        assert res.status_code == 200, "Retrieval should return HTTP 200"
+            ingest = client.post(
+                "/v1/memories",
+                json={
+                    "user_id": USER_ID,
+                    "content": "Dave prefers dark mode and codes primarily in Python.",
+                    "workspace_id": WORKSPACE_ID,
+                    "source_event_id": "http-smoke:turn-1",
+                    "occurred_at": "2026-07-19T09:30:00Z",
+                },
+                headers=headers,
+            )
+            assert ingest.status_code == 200, ingest.text
 
-        # Check if Dave's preference is in results
-        results = res.json().get("results", [])
-        assert len(results) > 0, "Should return at least one retrieved memory"
-        print(f"[PASS] Successfully retrieved memory: '{results[0]['content']}'")
+            retrieval = client.post(
+                "/v1/memories/retrieve",
+                json={
+                    "user_id": USER_ID,
+                    "query": "What preferences does Dave have?",
+                    "limit": 3,
+                    "workspace_id": WORKSPACE_ID,
+                },
+                headers=headers,
+            )
+            assert retrieval.status_code == 200, retrieval.text
+            results = retrieval.json().get("results", [])
+            assert any("dark mode" in item["content"].lower() for item in results), results
 
-        # 4. Test Consolidation endpoint
-        print("\nSending Consolidation request to /v1/memories/consolidate...")
-        res = requests.post(f"{base_url}/v1/memories/consolidate?user_id={user_id}&workspace_id=api_test", headers=headers, timeout=30.0)
-        print(f"Status Code: {res.status_code}")
-        print(f"Response: {res.json()}")
-        assert res.status_code == 200, "Consolidation should return HTTP 200"
+            consolidation = client.post(
+                f"/v1/memories/consolidate?user_id={USER_ID}&workspace_id={WORKSPACE_ID}",
+                headers=headers,
+            )
+            assert consolidation.status_code == 200, consolidation.text
 
-        # 5. Test List Tools endpoint
-        print("\nSending MCP List Tools request to /tools...")
-        res = requests.get(f"{base_url}/tools", headers=headers, timeout=30.0)
-        print(f"Status Code: {res.status_code}")
-        print(f"Response: {res.json()}")
-        assert res.status_code == 200, "Tools listing should return HTTP 200"
+            tools_response = client.get("/tools", headers=headers)
+            assert tools_response.status_code == 200, tools_response.text
 
-        print("\n" + "=" * 60)
-        print("  ALL API ROUTE INTEGRATIONS VERIFIED SUCCESSFULLY!")
-        print("=" * 60)
-
-    except Exception as e:
-        print(f"\n[ERROR] API testing failed: {e}")
-        raise e
+        print("[PASS] HTTP routes and application readiness verified.")
     finally:
-        print("\nStopping background Uvicorn Server...")
-        process.terminate()
-        process.wait()
-        print("Server stopped.")
+        cleanup()
 
-        print("Cleaning up test API key...")
-        try:
-            conn = get_postgres_conn()
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM api_keys WHERE key_hash = %s", (hash_api_key("test_api_server_key"),))
-            conn.commit()
-            conn.close()
-            print("Cleanup successful.")
-        except Exception as cleanup_err:
-            print(f"[WARNING] Failed to clean up API key: {cleanup_err}")
 
 if __name__ == "__main__":
     test_api_endpoints()

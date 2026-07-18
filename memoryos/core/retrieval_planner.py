@@ -20,11 +20,51 @@ STOPWORDS = {
     'does', 'do', 'what', 'where', 'why', 'who', 'how', 'tell', 'show', 'find', 'get', 'list', 'about'
 }
 
+
+def _classify_intent(query_lower: str) -> str:
+    """Return the retrieval intent without requiring an NLP model."""
+    preference_keywords = ["like", "prefer", "love", "hate", "favorite", "dislike", "interest", "want"]
+    temporal_keywords = ["when", "date", "yesterday", "last week", "recent", "valid", "history", "time", "before", "after", "ago"]
+    if any(keyword in query_lower for keyword in preference_keywords):
+        return "preference_query"
+    if any(keyword in query_lower for keyword in temporal_keywords):
+        return "temporal_query"
+    return "factual_lookup"
+
+
+def _plan_without_spacy(query: str) -> dict:
+    """Provide deterministic keyword retrieval when the optional parser is absent.
+
+    The lightweight Docker image deliberately omits spaCy. Retrieval must still
+    preserve the lexical terms that make sparse search a useful complement to
+    dense ranking; otherwise a missing optional model turns hybrid retrieval
+    into hash-vector lottery in offline integration mode.
+    """
+    raw_tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", query)
+    keywords = sorted({
+        token.lower()
+        for token in raw_tokens
+        if len(token) > 1 and token.lower() not in STOPWORDS
+    })
+    entities = sorted({
+        token.lower()
+        for token in raw_tokens
+        if token[:1].isupper() and token.lower() not in STOPWORDS
+    })
+    return {
+        "entities": entities,
+        "intent": _classify_intent(query.lower()),
+        "keywords": keywords,
+    }
+
+
 def plan_retrieval(query: str) -> dict:
     """
     Parses user query to extract entities, intent, and clean search keywords.
     """
     nlp = load_spacy_model()
+    if nlp is None:
+        return _plan_without_spacy(query)
     doc = nlp(query)
     
     # 1. Extract Entities
@@ -55,15 +95,7 @@ def plan_retrieval(query: str) -> dict:
             
     # 2. Classify Intent
     query_lower = query.lower()
-    intent = "factual_lookup"
-    
-    preference_keywords = ["like", "prefer", "love", "hate", "favorite", "dislike", "interest", "want"]
-    temporal_keywords = ["when", "date", "yesterday", "last week", "recent", "valid", "history", "time", "before", "after", "ago"]
-    
-    if any(k in query_lower for k in preference_keywords):
-        intent = "preference_query"
-    elif any(k in query_lower for k in temporal_keywords):
-        intent = "temporal_query"
+    intent = _classify_intent(query_lower)
         
     # 3. Extract Keywords (clean content tokens)
     keywords = []

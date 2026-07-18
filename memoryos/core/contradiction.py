@@ -2,6 +2,12 @@ from datetime import datetime, timezone
 from memoryos.config import logger
 from memoryos.db.postgres import get_postgres_conn
 
+# These predicates describe one current value for a subject.  Tool use,
+# interests, ownership, and preferences are intentionally multi-valued: a new
+# observation must add evidence instead of silently erasing an older memory.
+SINGLE_VALUED_RELATIONSHIPS = frozenset({"WORKS_AT", "LIVES_IN"})
+
+
 def resolve_contradictions(user_id: str, workspace_id: str, relationships: list, neo4j):
     """
     Detects and resolves contradictory relationships in the knowledge graph.
@@ -12,18 +18,20 @@ def resolve_contradictions(user_id: str, workspace_id: str, relationships: list,
     resolved_count = 0
     for rel in relationships:
         # Only resolve contradictions for single-valued relationships
-        if rel["type"] not in ["USES", "WORKS_AT", "LIVES_IN"]:
+        if rel["type"] not in SINGLE_VALUED_RELATIONSHIPS:
             continue
         try:
             # Check for existing relationships of the same type from the same source
             existing = neo4j.query(
-                "MATCH (s:Entity {name: $source, workspace_id: $workspace_id})"
-                "-[r]->(t:Entity) "
-                "WHERE type(r) = $rel_type AND t.name <> $target AND coalesce(r.is_active, true) = true "
+                "MATCH (s:Entity {name: $source, workspace_id: $workspace_id, user_id: $user_id})"
+                "-[r]->(t:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
+                "WHERE type(r) = $rel_type AND r.user_id = $user_id "
+                "AND t.name <> $target AND coalesce(r.is_active, true) = true "
                 "RETURN t.name AS old_target, type(r) AS rel_type",
                 {
                     "source": rel["source"],
                     "workspace_id": workspace_id,
+                    "user_id": user_id,
                     "rel_type": rel["type"],
                     "target": rel["target"]
                 }
@@ -40,12 +48,13 @@ def resolve_contradictions(user_id: str, workspace_id: str, relationships: list,
                     old_target = old_rel.get("old_target", "")
                     
                     neo4j.query(
-                        f"MATCH (s:Entity {{name: $source, workspace_id: $workspace_id}})"
-                        f"-[r:{rel['type']}]->(t:Entity {{name: $old_target}}) "
+                        f"MATCH (s:Entity {{name: $source, workspace_id: $workspace_id, user_id: $user_id}})"
+                        f"-[r:{rel['type']} {{user_id: $user_id}}]->(t:Entity {{name: $old_target, workspace_id: $workspace_id, user_id: $user_id}}) "
                         f"SET r.is_active = false, r.valid_to = $timestamp, r.superseded_by = $new_target",
                         {
                             "source": rel["source"],
                             "workspace_id": workspace_id,
+                            "user_id": user_id,
                             "old_target": old_target,
                             "new_target": rel["target"],
                             "timestamp": timestamp_str
@@ -54,9 +63,9 @@ def resolve_contradictions(user_id: str, workspace_id: str, relationships: list,
                     
                     # Create SUPERSEDED_BY relationship between old and new targets
                     neo4j.query(
-                        "MATCH (old_t:Entity {name: $old_target, workspace_id: $workspace_id}) "
-                        "MATCH (new_t:Entity {name: $new_target, workspace_id: $workspace_id}) "
-                        "MERGE (old_t)-[sr:SUPERSEDED_BY {relationship_type: $rel_type, subject: $source, workspace_id: $workspace_id}]->(new_t) "
+                        "MATCH (old_t:Entity {name: $old_target, workspace_id: $workspace_id, user_id: $user_id}) "
+                        "MATCH (new_t:Entity {name: $new_target, workspace_id: $workspace_id, user_id: $user_id}) "
+                        "MERGE (old_t)-[sr:SUPERSEDED_BY {relationship_type: $rel_type, subject: $source, workspace_id: $workspace_id, user_id: $user_id}]->(new_t) "
                         "SET sr.timestamp = $timestamp",
                         {
                             "old_target": old_target,
@@ -64,6 +73,7 @@ def resolve_contradictions(user_id: str, workspace_id: str, relationships: list,
                             "rel_type": rel["type"],
                             "source": rel["source"],
                             "workspace_id": workspace_id,
+                            "user_id": user_id,
                             "timestamp": timestamp_str
                         }
                     )

@@ -48,7 +48,10 @@ services:
     build:
       context: .
       args:
-        INSTALL_ML: "false"
+        # The default image is deliberately light enough for local durable
+        # integration checks.  Set MEMORYOS_INSTALL_ML=true together with
+        # MEMORYOS_OFFLINE_MODE=false for the full local semantic runtime.
+        INSTALL_ML: "${MEMORYOS_INSTALL_ML:-false}"
     command: ["python", "-m", "memoryos.migrations", "upgrade"]
     environment:
       POSTGRES_HOST: postgres-db
@@ -60,7 +63,7 @@ services:
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env}
       MEMORYOS_ALLOW_IN_MEMORY_FALLBACK: "false"
-      OFFLINE_MODE: "true"
+      OFFLINE_MODE: "${MEMORYOS_OFFLINE_MODE:-true}"
     depends_on:
       postgres-db:
         condition: service_healthy
@@ -72,7 +75,7 @@ services:
     build:
       context: .
       args:
-        INSTALL_ML: "false"
+        INSTALL_ML: "${MEMORYOS_INSTALL_ML:-false}"
     command: ["uvicorn", "memoryos.main:app", "--host", "0.0.0.0", "--port", "8088"]
     environment:
       POSTGRES_HOST: postgres-db
@@ -84,7 +87,7 @@ services:
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env}
       MEMORYOS_ALLOW_IN_MEMORY_FALLBACK: "false"
-      OFFLINE_MODE: "true"
+      OFFLINE_MODE: "${MEMORYOS_OFFLINE_MODE:-true}"
     ports:
       - "127.0.0.1:${MEMORYOS_PORT:-8088}:8088"
     depends_on:
@@ -96,7 +99,7 @@ services:
     build:
       context: .
       args:
-        INSTALL_ML: "false"
+        INSTALL_ML: "${MEMORYOS_INSTALL_ML:-false}"
     command: ["python", "-m", "memoryos.worker", "--interval", "5", "--batch-size", "100"]
     environment:
       POSTGRES_HOST: postgres-db
@@ -108,7 +111,7 @@ services:
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env}
       MEMORYOS_ALLOW_IN_MEMORY_FALLBACK: "false"
-      OFFLINE_MODE: "true"
+      OFFLINE_MODE: "${MEMORYOS_OFFLINE_MODE:-true}"
     depends_on:
       migrate:
         condition: service_completed_successfully

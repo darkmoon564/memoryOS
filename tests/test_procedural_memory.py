@@ -98,8 +98,21 @@ def test_procedural_memory_system():
         assert len(has_wf_rels) > 0, "Expected User to link to Workflow"
         assert len(uses_tech_rels) > 0, "Expected Workflow to link to detected Tech (e.g. docker or postgres)"
     else:
-        res_wf_nodes = neo4j.query("MATCH (w:Workflow {workspace_id: $workspace_id}) RETURN w.name AS name", {"workspace_id": workspace_id})
-        assert len(res_wf_nodes) > 0, "Expected Workflow node in Neo4j"
+        res_wf_nodes = neo4j.query(
+            "MATCH (w:Workflow {workspace_id: $workspace_id, user_id: $user_id}) RETURN w.name AS name",
+            {"workspace_id": workspace_id, "user_id": user_id},
+        )
+        assert any(row["name"] == "deploy application" for row in res_wf_nodes), "Expected user-scoped Workflow node in Neo4j"
+        has_workflow = neo4j.query(
+            "MATCH (:User {id: $user_id, workspace_id: $workspace_id})-[:HAS_WORKFLOW {user_id: $user_id}]->(:Workflow {name: 'deploy application', workspace_id: $workspace_id, user_id: $user_id}) RETURN count(*) AS count",
+            {"workspace_id": workspace_id, "user_id": user_id},
+        )
+        assert has_workflow[0]["count"] == 1, "Expected User to link to Workflow"
+        uses_tech = neo4j.query(
+            "MATCH (:Workflow {name: 'deploy application', workspace_id: $workspace_id, user_id: $user_id})-[:USES_TECH {user_id: $user_id}]->(:Entity {workspace_id: $workspace_id, user_id: $user_id}) RETURN count(*) AS count",
+            {"workspace_id": workspace_id, "user_id": user_id},
+        )
+        assert uses_tech[0]["count"] >= 1, "Expected Workflow to link to detected technology entities"
         
     # 5. Retrieve Context via temporal/how-to trigger
     print("\nStep 4: Retrieving context with procedural 'how to' query...")

@@ -189,36 +189,47 @@ async def evaluate_accuracy():
     
     # Ingest a memory to decay
     decay_text = "Dave visited Berlin in 2021."
-    decay_res = await ingest_memory(MemoryIngest(user_id=user_id, content=decay_text, workspace_id=workspace_id), bg_tasks)
+    decay_res = await ingest_memory(
+        MemoryIngest(
+            user_id=user_id,
+            content=decay_text,
+            workspace_id=workspace_id,
+            # The question is explicitly historical; test the source event
+            # time rather than the later database ingestion time.
+            occurred_at=datetime(2021, 6, 1, tzinfo=timezone.utc),
+        ),
+        bg_tasks,
+    )
     
-    # Manually simulate historical decay inside DB (accessed 100 days ago)
+    # Manually simulate a long-unaccessed, low-importance memory.
     conn = get_postgres_conn()
-    hundred_days_ago = datetime.now(timezone.utc) - timedelta(days=100)
+    year_ago = datetime.now(timezone.utc) - timedelta(days=365)
     with conn.cursor() as cur:
-        # Update last accessed and decrease static importance
+        # Establish a genuinely stale, low-value memory. Earlier distractor
+        # queries can legitimately retrieve this item incidentally, so reset
+        # frequency as well as last access and static importance.
         cur.execute(
-            "UPDATE memories SET last_accessed_at = %s, importance_score = 0.1 WHERE id = %s",
-            (hundred_days_ago, decay_res.memory_id)
+            "UPDATE memories SET last_accessed_at = %s, importance_score = 0.1, frequency_count = 1 WHERE id = %s",
+            (year_ago, decay_res.memory_id)
         )
     conn.commit()
     conn.close()
     
     # Apply decay sweep
     from memoryos.api.memories import apply_decay
-    decay_sweep = await apply_decay()
-    print(f"  Applied decay sweep. Archived memories count: {decay_sweep['archived_count']}")
+    decay_sweep = await apply_decay(workspace_id=workspace_id)
+    print(f"  Applied decay sweep. Evaluated memories count: {decay_sweep['evaluated_count']}")
     
-    # Verify that the decayed memory is no longer returned
+    # Verify that a stale memory stays recoverable but reports lower retrieval
+    # freshness rather than being silently made unreachable.
     res = await retrieve_context(MemoryRetrieve(user_id=user_id, query="Where did Dave travel to in 2021?", limit=3, workspace_id=workspace_id))
-    active_memory_text = " ".join(
-        r.content for r in res.results if r.type != "EPISODIC"
-    )
+    berlin_memory = next((r for r in res.results if "berlin" in r.content.lower()), None)
     
-    if "berlin" not in active_memory_text.lower():
-        print("  [SUCCESS] Decayed memory successfully pruned and filtered from active context.")
+    if berlin_memory and berlin_memory.decay < 0.30:
+        print("  [SUCCESS] Stale memory remains recoverable with a reduced decay strength.")
         scenario_3_pass = True
     else:
-        print("  [FAILED] Decayed memory was still returned in retrieval context.")
+        print("  [FAILED] Stale memory did not receive the expected reduced decay strength.")
         scenario_3_pass = False
 
     # ------------------------------------------------------------------
@@ -234,7 +245,7 @@ async def evaluate_accuracy():
     print("=" * 70)
     assert scenario_1_pass, "Recall@3 did not exceed the 90% threshold."
     assert scenario_2_pass, "Current factual retrieval still contains the superseded employment fact."
-    assert scenario_3_pass, "An inactive memory was returned outside historical episode context."
+    assert scenario_3_pass, "A stale memory was not conservatively deprioritized."
 
 if __name__ == "__main__":
     from unittest.mock import patch

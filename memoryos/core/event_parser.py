@@ -25,6 +25,10 @@ EVENT_PARSER_SYSTEM_PROMPT = (
 
 def _extract_events_via_llm_api(content: str) -> list | None:
     """Attempts to split content into atomic events using a configured LLM API."""
+    if os.getenv("OFFLINE_MODE", "false").lower() == "true":
+        # Offline mode is a hard no-network contract for deterministic tests
+        # and air-gapped deployments; proceed directly to the local parser.
+        return None
     timeout = float(os.getenv("LLM_TIMEOUT", "15.0"))
     
     # ── Mode 1: OpenAI-compatible API ──

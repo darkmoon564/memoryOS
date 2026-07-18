@@ -114,24 +114,25 @@ def run_reflection(user_id: str, workspace_id: str, neo4j) -> list:
             # Graph update: Merge subject and object entities, and create relationship
             # Merge source entity
             neo4j.query(
-                "MERGE (s:Entity {name: $source, workspace_id: $workspace_id}) SET s.type = 'Person'",
-                {"source": subj, "workspace_id": workspace_id}
+                "MERGE (s:Entity {name: $source, workspace_id: $workspace_id, user_id: $user_id}) SET s.type = 'Person'",
+                {"source": subj, "workspace_id": workspace_id, "user_id": user_id}
             )
             # Merge target entity
             neo4j.query(
-                "MERGE (t:Entity {name: $target, workspace_id: $workspace_id})",
-                {"target": obj, "workspace_id": workspace_id}
+                "MERGE (t:Entity {name: $target, workspace_id: $workspace_id, user_id: $user_id})",
+                {"target": obj, "workspace_id": workspace_id, "user_id": user_id}
             )
             # Merge relationship
             neo4j.query(
-                f"MATCH (s:Entity {{name: $source, workspace_id: $workspace_id}}) "
-                f"MATCH (t:Entity {{name: $target, workspace_id: $workspace_id}}) "
-                f"MERGE (s)-[r:{pred}]->(t) "
-                f"SET r.confidence = $confidence, r.is_active = true",
+                f"MATCH (s:Entity {{name: $source, workspace_id: $workspace_id, user_id: $user_id}}) "
+                f"MATCH (t:Entity {{name: $target, workspace_id: $workspace_id, user_id: $user_id}}) "
+                f"MERGE (s)-[r:{pred} {{user_id: $user_id}}]->(t) "
+                f"SET r.workspace_id = $workspace_id, r.confidence = $confidence, r.is_active = true",
                 {
                     "source": subj,
                     "target": obj,
                     "workspace_id": workspace_id,
+                    "user_id": user_id,
                     "confidence": conf
                 }
             )
@@ -139,10 +140,11 @@ def run_reflection(user_id: str, workspace_id: str, neo4j) -> list:
             # Connect User Node to both entities via KNOWS_ABOUT
             user_query = """
                 MERGE (u:User {id: $user_id, workspace_id: $workspace_id})
-                MERGE (s:Entity {name: $source, workspace_id: $workspace_id})
-                MERGE (t:Entity {name: $target, workspace_id: $workspace_id})
-                MERGE (u)-[:KNOWS_ABOUT]->(s)
-                MERGE (u)-[:KNOWS_ABOUT]->(t)
+                MERGE (s:Entity {name: $source, workspace_id: $workspace_id, user_id: $user_id})
+                MERGE (t:Entity {name: $target, workspace_id: $workspace_id, user_id: $user_id})
+                MERGE (u)-[rs:KNOWS_ABOUT {user_id: $user_id}]->(s)
+                MERGE (u)-[rt:KNOWS_ABOUT {user_id: $user_id}]->(t)
+                SET rs.workspace_id = $workspace_id, rt.workspace_id = $workspace_id
             """
             neo4j.query(user_query, {
                 "user_id": user_id,
@@ -155,7 +157,9 @@ def run_reflection(user_id: str, workspace_id: str, neo4j) -> list:
         except Exception as graph_err:
             logger.error(f"[Reflection] Failed to commit fact to graph: {fact} Error: {graph_err}")
             
-    # 4. Archive raw conversation logs linked to the workspace to reduce retrieval noise
+    # 4. Remove raw conversation logs after their graph facts are projected.
+    # The durable event store remains the recovery source; writing a second
+    # filesystem archive would make a later user-data purge incomplete.
     if committed_facts:
         try:
             from psycopg2.extras import RealDictCursor
@@ -172,16 +176,6 @@ def run_reflection(user_id: str, workspace_id: str, neo4j) -> list:
                 logs_to_archive = cur.fetchall()
                 
                 if logs_to_archive:
-                    archive_dir = "archive"
-                    os.makedirs(archive_dir, exist_ok=True)
-                    archive_path = os.path.join(archive_dir, f"archived_logs_{user_id}.jsonl")
-                    
-                    with open(archive_path, "a", encoding="utf-8") as f:
-                        for log in logs_to_archive:
-                            created_val = log["created_at"]
-                            log["created_at"] = created_val.isoformat() if hasattr(created_val, "isoformat") else str(created_val)
-                            f.write(json.dumps(log) + "\n")
-                            
                     log_ids = [log["id"] for log in logs_to_archive]
                     placeholders = ",".join(["%s"] * len(log_ids))
                     cur.execute(
@@ -190,9 +184,9 @@ def run_reflection(user_id: str, workspace_id: str, neo4j) -> list:
                     )
             conn.commit()
             conn.close()
-            logger.info(f"[Reflection] Archived {len(logs_to_archive)} conversation logs for user {user_id}")
+            logger.info(f"[Reflection] Removed {len(logs_to_archive)} projected conversation logs for user {user_id}")
         except Exception as arch_err:
-            logger.error(f"[Reflection] Failed to archive conversation logs: {arch_err}")
+            logger.error(f"[Reflection] Failed to remove projected conversation logs: {arch_err}")
             
     logger.info(f"[Reflection] Successfully committed {len(committed_facts)} facts to Neo4j")
     return committed_facts

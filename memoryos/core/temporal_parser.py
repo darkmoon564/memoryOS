@@ -13,6 +13,24 @@ def parse_temporal_window(query: str, current_time: datetime = None) -> tuple[da
             current_time = current_time.replace(tzinfo=timezone.utc)
             
     query_lower = query.lower()
+
+    # Explicit ISO-style dates and years are common in memory questions and
+    # must use the event's occurrence time rather than the ingestion time.
+    date_match = re.search(r"\b(19|20)\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b", query_lower)
+    if date_match:
+        try:
+            day = datetime.fromisoformat(date_match.group(0)).replace(tzinfo=timezone.utc)
+            return day, day + timedelta(days=1) - timedelta(microseconds=1)
+        except ValueError:
+            pass
+
+    year_match = re.search(r"\b(19|20)\d{2}\b", query_lower)
+    if year_match:
+        year = int(year_match.group(0))
+        return (
+            datetime(year, 1, 1, tzinfo=timezone.utc),
+            datetime(year, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
+        )
     
     # Yesterday
     if "yesterday" in query_lower:

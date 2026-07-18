@@ -114,19 +114,19 @@ def consolidate_hierarchy(user_id: str, workspace_id: str, neo4j) -> dict:
             # Merge Topic Entity
             neo4j.query(
                 """
-                MERGE (t:Entity {name: $name, workspace_id: $workspace_id})
+                MERGE (t:Entity {name: $name, workspace_id: $workspace_id, user_id: $user_id})
                 SET t.type = 'Topic'
                 """,
-                {"name": topic_name, "workspace_id": workspace_id}
+                {"name": topic_name, "workspace_id": workspace_id, "user_id": user_id}
             )
             
             # Connect User to Topic via LEARNING_TOPIC
             neo4j.query(
                 """
                 MATCH (u:User {id: $user_id, workspace_id: $workspace_id})
-                MATCH (t:Entity {name: $name, workspace_id: $workspace_id})
-                MERGE (u)-[r:LEARNING_TOPIC]->(t)
-                SET r.is_active = true
+                MATCH (t:Entity {name: $name, workspace_id: $workspace_id, user_id: $user_id})
+                MERGE (u)-[r:LEARNING_TOPIC {user_id: $user_id}]->(t)
+                SET r.workspace_id = $workspace_id, r.is_active = true
                 """,
                 {"user_id": user_id, "name": topic_name, "workspace_id": workspace_id}
             )
@@ -140,18 +140,19 @@ def consolidate_hierarchy(user_id: str, workspace_id: str, neo4j) -> dict:
                 # Merge Episode Entity
                 neo4j.query(
                     """
-                    MERGE (e:Entity {name: $name, workspace_id: $workspace_id})
+                    MERGE (e:Entity {name: $name, workspace_id: $workspace_id, user_id: $user_id})
                     SET e.type = 'Episode'
                     """,
-                    {"name": ep_clean, "workspace_id": workspace_id}
+                    {"name": ep_clean, "workspace_id": workspace_id, "user_id": user_id}
                 )
                 
                 # Connect User knows about Episode
                 neo4j.query(
                     """
                     MATCH (u:User {id: $user_id, workspace_id: $workspace_id})
-                    MATCH (e:Entity {name: $name, workspace_id: $workspace_id})
-                    MERGE (u)-[r:KNOWS_ABOUT]->(e)
+                    MATCH (e:Entity {name: $name, workspace_id: $workspace_id, user_id: $user_id})
+                    MERGE (u)-[r:KNOWS_ABOUT {user_id: $user_id}]->(e)
+                    SET r.workspace_id = $workspace_id, r.is_active = true
                     """,
                     {"user_id": user_id, "name": ep_clean, "workspace_id": workspace_id}
                 )
@@ -159,12 +160,12 @@ def consolidate_hierarchy(user_id: str, workspace_id: str, neo4j) -> dict:
                 # Link Episode to Topic
                 neo4j.query(
                     """
-                    MATCH (e:Entity {name: $ep_name, workspace_id: $workspace_id})
-                    MATCH (t:Entity {name: $topic_name, workspace_id: $workspace_id})
-                    MERGE (e)-[r:BELONGS_TO_TOPIC]->(t)
-                    SET r.is_active = true
+                    MATCH (e:Entity {name: $ep_name, workspace_id: $workspace_id, user_id: $user_id})
+                    MATCH (t:Entity {name: $topic_name, workspace_id: $workspace_id, user_id: $user_id})
+                    MERGE (e)-[r:BELONGS_TO_TOPIC {user_id: $user_id}]->(t)
+                    SET r.workspace_id = $workspace_id, r.is_active = true
                     """,
-                    {"ep_name": ep_clean, "topic_name": topic_name, "workspace_id": workspace_id}
+                    {"ep_name": ep_clean, "topic_name": topic_name, "workspace_id": workspace_id, "user_id": user_id}
                 )
                 
             committed_topics += 1
@@ -178,19 +179,19 @@ def consolidate_hierarchy(user_id: str, workspace_id: str, neo4j) -> dict:
             # Merge Profile Entity
             neo4j.query(
                 """
-                MERGE (p:Entity {name: $name, workspace_id: $workspace_id})
+                MERGE (p:Entity {name: $name, workspace_id: $workspace_id, user_id: $user_id})
                 SET p.type = 'Profile'
                 """,
-                {"name": prof_fact, "workspace_id": workspace_id}
+                {"name": prof_fact, "workspace_id": workspace_id, "user_id": user_id}
             )
             
             # Connect User to Profile via HAS_PROFILE
             neo4j.query(
                 """
                 MATCH (u:User {id: $user_id, workspace_id: $workspace_id})
-                MATCH (p:Entity {name: $name, workspace_id: $workspace_id})
-                MERGE (u)-[r:HAS_PROFILE]->(p)
-                SET r.is_active = true
+                MATCH (p:Entity {name: $name, workspace_id: $workspace_id, user_id: $user_id})
+                MERGE (u)-[r:HAS_PROFILE {user_id: $user_id}]->(p)
+                SET r.workspace_id = $workspace_id, r.is_active = true
                 """,
                 {"user_id": user_id, "name": prof_fact, "workspace_id": workspace_id}
             )
@@ -203,12 +204,12 @@ def consolidate_hierarchy(user_id: str, workspace_id: str, neo4j) -> dict:
                     
                 neo4j.query(
                     """
-                    MATCH (t:Entity {name: $topic_name, workspace_id: $workspace_id})
-                    MATCH (p:Entity {name: $prof_fact, workspace_id: $workspace_id})
-                    MERGE (t)-[r:BELONGS_TO_PROFILE]->(p)
-                    SET r.is_active = true
+                    MATCH (t:Entity {name: $topic_name, workspace_id: $workspace_id, user_id: $user_id})
+                    MATCH (p:Entity {name: $prof_fact, workspace_id: $workspace_id, user_id: $user_id})
+                    MERGE (t)-[r:BELONGS_TO_PROFILE {user_id: $user_id}]->(p)
+                    SET r.workspace_id = $workspace_id, r.is_active = true
                     """,
-                    {"topic_name": t_clean, "prof_fact": prof_fact, "workspace_id": workspace_id}
+                    {"topic_name": t_clean, "prof_fact": prof_fact, "workspace_id": workspace_id, "user_id": user_id}
                 )
                 
             committed_profiles += 1

@@ -9,11 +9,12 @@ WORKDIR /app
 COPY requirements.txt ./
 COPY requirements.runtime.txt ./
 ARG INSTALL_ML=false
-# Integration images use the deterministic offline models. Full semantic models
-# are opt-in, and use CPU wheels rather than CUDA libraries.
+# The full semantic image uses CPU-only model dependencies and includes the
+# local parser model used when an extraction LLM is not configured.
 RUN if [ "$INSTALL_ML" = "true" ]; then \
       pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch \
-      && pip install --no-cache-dir -r requirements.txt; \
+      && pip install --no-cache-dir -r requirements.txt \
+      && python -m spacy download en_core_web_sm; \
     else \
       pip install --no-cache-dir -r requirements.runtime.txt; \
     fi

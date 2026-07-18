@@ -23,7 +23,12 @@ from memoryos.core.cache import stm_cache
 from memoryos.core.working_memory import working_memory
 from memoryos.core.event_store import log_event, replay_events
 from memoryos.core.classifier import classify_memory
-from memoryos.core.scorer import calculate_importance, _execute_decay_logic
+from memoryos.core.scorer import (
+    calculate_importance,
+    calculate_decay_strength,
+    calculate_recency_strength,
+    _execute_decay_logic,
+)
 from memoryos.core.event_parser import parse_events
 from memoryos.services.background import background_graph_ingest
 from memoryos.core.episodes import process_conversation_log
@@ -138,10 +143,10 @@ def format_context_markdown(results: list, temporal_range: tuple = None, working
 
     # Chronological Timeline Event sequence
     if timeline_items:
-        timeline_items.sort(key=lambda x: x.get("created_at", ""))
+        timeline_items.sort(key=lambda x: x.get("occurred_at") or x.get("created_at", ""))
         parts.append("## Chronological Timeline")
         for item in timeline_items:
-            dt_str = item.get("created_at", "")[:10]
+            dt_str = (item.get("occurred_at") or item.get("created_at", ""))[:10]
             parts.append(f"- [{dt_str}] {item['content']}")
         parts.append("")
 
@@ -211,13 +216,14 @@ def compile_multidimensional_scores(item_info: dict, score: float, source: str) 
         except Exception:
             created_at = datetime.now(timezone.utc)
 
-    if created_at:
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        delta_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
-        recency = max(0.0, 1.0 - (delta_seconds / (30.0 * 86400.0)))
-    else:
-        recency = 1.0
+    last_accessed_at = item_info.get("last_accessed_at") or created_at
+    if isinstance(last_accessed_at, str):
+        try:
+            last_accessed_at = datetime.fromisoformat(last_accessed_at.replace("Z", "+00:00"))
+        except ValueError:
+            last_accessed_at = created_at
+
+    recency = calculate_recency_strength(last_accessed_at)
 
     mem_type = item_info.get("memory_type", "EPISODIC") or "EPISODIC"
     if importance >= 0.75 or mem_type == "FACTUAL" or source == "graph":
@@ -225,8 +231,7 @@ def compile_multidimensional_scores(item_info: dict, score: float, source: str) 
     else:
         verification = "unverified"
 
-    decay_level = float(item_info.get("decay_level", 0.0) or 0.0)
-    decay = max(0.1, 1.0 - decay_level)
+    decay = calculate_decay_strength(last_accessed_at, importance, frequency)
 
     return {
         "confidence": confidence,
@@ -273,6 +278,91 @@ def apply_goal_boost(content: str, mem_type: str, score: float, category: str) -
             boosted_score *= 1.25
     return boosted_score
 
+
+# Small, explicit relation aliases improve sparse recall for ordinary agent
+# questions without treating a keyword match as semantic understanding.  The
+# expansion is deliberately bounded and is still followed by dense retrieval
+# and reranking.
+_SPARSE_TERM_ALIASES = {
+    "reside": ("live", "lives", "residence"),
+    "resides": ("live", "lives", "residence"),
+    "residence": ("live", "lives", "reside"),
+    "language": ("speak", "speaks", "languages"),
+    "languages": ("speak", "speaks", "language"),
+    "speak": ("speaks", "language", "languages"),
+    "spouse": ("wife", "husband", "partner"),
+    "job": ("works", "worked", "employed"),
+    "work": ("works", "worked", "employed"),
+    "employer": ("works", "worked", "employed"),
+}
+
+
+def _expand_sparse_terms(terms: list[str]) -> list[str]:
+    """Return de-duplicated sparse terms plus a small set of relation aliases."""
+    expanded: list[str] = []
+    for raw_term in terms:
+        term = raw_term.strip().lower()
+        if not term:
+            continue
+        if term not in expanded:
+            expanded.append(term)
+        for alias in _SPARSE_TERM_ALIASES.get(term, ()):
+            if alias not in expanded:
+                expanded.append(alias)
+    return expanded
+
+
+def _normalized_rank_scores(ordered_ids: list[str], floor: float = 0.15) -> dict[str, float]:
+    """Map an ordered candidate list to stable bounded relevance signals.
+
+    The floor keeps a valid bottom-ranked candidate recoverable when the
+    caller asks for more results than the usual top few.
+    """
+    if not ordered_ids:
+        return {}
+    floor = min(1.0, max(0.0, float(floor)))
+    if len(ordered_ids) == 1:
+        return {ordered_ids[0]: 1.0}
+    denominator = len(ordered_ids) - 1
+    return {
+        doc_id: floor + ((1.0 - floor) * (1.0 - (index / denominator)))
+        for index, doc_id in enumerate(ordered_ids)
+    }
+
+
+def _rank_reranker_candidates(
+    candidates: list[tuple[str, float]],
+    rerank_scores: list[float],
+) -> list[str]:
+    """Return reranker order with deterministic ties and validated model output."""
+    if len(rerank_scores) != len(candidates):
+        raise ValueError("Reranker returned a score count different from the candidate count")
+    normalized_scores = [float(score) for score in rerank_scores]
+    if not all(math.isfinite(score) for score in normalized_scores):
+        raise ValueError("Reranker returned a non-finite score")
+    return [
+        doc_id
+        for _, _, doc_id in sorted(
+            ((index, normalized_scores[index], doc_id) for index, (doc_id, _) in enumerate(candidates)),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+
+
+def _ranked_ids(rows: list[dict]) -> list[str]:
+    """Deduplicate a database result set without changing its supplied order."""
+    return list(dict.fromkeys(str(row["id"]) for row in rows))
+
+
+def _apply_freshness_to_relevance(relevance_score: float, freshness: float) -> float:
+    """Use freshness as a conservative modifier rather than a relevance replacement."""
+    bounded_relevance = min(1.0, max(0.0, float(relevance_score)))
+    bounded_freshness = min(1.0, max(0.0, float(freshness)))
+    # A query match must remain dominant over access age: an old but exact
+    # memory should beat a fresh unrelated one. Freshness can still reorder
+    # close candidates and is exposed transparently in the response.
+    return bounded_relevance * (0.90 + (0.10 * bounded_freshness))
+
 @router.post("/v1/memories/retrieve")
 async def retrieve_context(
     data: MemoryRetrieve,
@@ -317,18 +407,21 @@ async def retrieve_context(
     if not graph_statements and neo4j:
         try:
             graph_query = (
-                "MATCH (u:User {id: $user_id})-[:KNOWS_ABOUT]->(e:Entity) "
+                "MATCH (u:User {id: $user_id, workspace_id: $workspace_id})-[known:KNOWS_ABOUT {user_id: $user_id}]->(e:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
                 "WHERE toLower($query) CONTAINS toLower(e.name) "
                 "OR EXISTS { "
-                "  MATCH (a:Alias)-[:ALIAS_OF]->(e) "
+                "  MATCH (a:Alias {workspace_id: $workspace_id, user_id: $user_id})-[:ALIAS_OF]->(e) "
                 "  WHERE toLower($query) CONTAINS toLower(a.name) "
                 "} "
-                "MATCH (e)-[r]->(target:Entity) "
-                "WHERE coalesce(r.is_active, true) = true "
+                "MATCH (e)-[r]->(target:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
+                "WHERE r.user_id = $user_id AND coalesce(r.is_active, true) = true "
                 "RETURN e.name AS source, type(r) AS rel, target.name AS target "
                 "LIMIT 10"
             )
-            graph_results = neo4j.query(graph_query, {"user_id": data.user_id, "query": data.query})
+            graph_results = neo4j.query(
+                graph_query,
+                {"user_id": data.user_id, "workspace_id": data.workspace_id, "query": data.query},
+            )
             for record in graph_results:
                 stmt = f"Fact: {record['source']} {record['rel'].lower().replace('_', ' ')} {record['target']}."
                 graph_statements.append(stmt)
@@ -355,6 +448,9 @@ async def retrieve_context(
         raise HTTPException(status_code=500, detail="Embedding failed.")
 
     start_time, end_time = parse_temporal_window(data.query)
+    # A superseded fact is hidden from ordinary current-state retrieval but is
+    # still historical evidence when the caller explicitly asks for a time.
+    memory_visibility_clause = "TRUE" if start_time and end_time else "is_active = TRUE"
 
     vector_results = []
     keyword_results = []
@@ -365,12 +461,12 @@ async def retrieve_context(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # 3. Dense Vector Search (memories)
             cur.execute(
-                """
-                SELECT id, content, memory_type, importance_score, frequency_count, created_at,
+                f"""
+                SELECT id, content, memory_type, importance_score, frequency_count, created_at, occurred_at, last_accessed_at,
                        (1 - (embedding <=> %s::vector)) AS vector_similarity
                 FROM memories
-                WHERE user_id = %s AND workspace_id = %s AND is_active = TRUE
-                ORDER BY embedding <=> %s::vector
+                WHERE user_id = %s AND workspace_id = %s AND {memory_visibility_clause}
+                ORDER BY embedding <=> %s::vector, id ASC
                 LIMIT 20
                 """,
                 (query_embedding, data.user_id, data.workspace_id, query_embedding)
@@ -380,11 +476,11 @@ async def retrieve_context(
             # 4. Dense Vector Search (episodes summary)
             cur.execute(
                 """
-                SELECT id, summary AS content, 'EPISODIC' AS memory_type, 0.80 AS importance_score, 1 AS frequency_count, created_at,
+                SELECT id, summary AS content, 'EPISODIC' AS memory_type, 0.80 AS importance_score, 1 AS frequency_count, created_at, created_at AS occurred_at, created_at AS last_accessed_at,
                        (1 - (embedding <=> %s::vector)) AS vector_similarity
                 FROM episodes
                 WHERE user_id = %s AND workspace_id = %s
-                ORDER BY embedding <=> %s::vector
+                ORDER BY embedding <=> %s::vector, id ASC
                 LIMIT 5
                 """,
                 (query_embedding, data.user_id, data.workspace_id, query_embedding)
@@ -392,20 +488,27 @@ async def retrieve_context(
             episode_results = cur.fetchall()
 
             # 5. Scoped Sparse Keyword Search
-            like_clauses = ["content ILIKE %s"]
-            params = [data.user_id, data.workspace_id, f"%{data.query}%"]
-
-            for ent in expanded_entities[:5]:
-                like_clauses.append("content ILIKE %s")
-                params.append(f"%{ent}%")
+            sparse_terms = _expand_sparse_terms([
+                term.strip()
+                for term in [data.query, *keywords[:5], *expanded_entities[:5]]
+                if term and term.strip()
+            ])
+            like_clauses = ["content ILIKE %s" for _ in sparse_terms]
+            term_patterns = [f"%{term}%" for term in sparse_terms]
+            sparse_match_score = " + ".join(
+                "CASE WHEN content ILIKE %s THEN 1 ELSE 0 END" for _ in sparse_terms
+            )
+            params = [*term_patterns, data.user_id, data.workspace_id, *term_patterns]
 
             clause_str = " OR ".join(like_clauses)
             cur.execute(
                 f"""
-                SELECT id, content, memory_type, importance_score, frequency_count, created_at
+                SELECT id, content, memory_type, importance_score, frequency_count, created_at, occurred_at, last_accessed_at,
+                       ({sparse_match_score}) AS sparse_match_score
                 FROM memories
-                WHERE user_id = %s AND workspace_id = %s AND is_active = TRUE
+                WHERE user_id = %s AND workspace_id = %s AND {memory_visibility_clause}
                   AND ({clause_str})
+                ORDER BY sparse_match_score DESC, occurred_at DESC, id ASC
                 LIMIT 20
                 """,
                 tuple(params)
@@ -416,11 +519,11 @@ async def retrieve_context(
             if start_time and end_time:
                 cur.execute(
                     """
-                    SELECT id, content, memory_type, importance_score, frequency_count, created_at, 1.0 AS vector_similarity
+                    SELECT id, content, memory_type, importance_score, frequency_count, created_at, occurred_at, last_accessed_at, 1.0 AS vector_similarity
                     FROM memories
-                    WHERE user_id = %s AND workspace_id = %s AND is_active = TRUE
-                      AND created_at BETWEEN %s AND %s
-                    ORDER BY created_at DESC
+                    WHERE user_id = %s AND workspace_id = %s
+                      AND occurred_at BETWEEN %s AND %s
+                    ORDER BY occurred_at DESC, id ASC
                     LIMIT 20
                     """,
                     (data.user_id, data.workspace_id, start_time, end_time)
@@ -431,11 +534,11 @@ async def retrieve_context(
 
                 cur.execute(
                     """
-                    SELECT id, summary AS content, 'EPISODIC' AS memory_type, 0.80 AS importance_score, 1 AS frequency_count, created_at, 1.0 AS vector_similarity
+                    SELECT id, summary AS content, 'EPISODIC' AS memory_type, 0.80 AS importance_score, 1 AS frequency_count, created_at, created_at AS occurred_at, created_at AS last_accessed_at, 1.0 AS vector_similarity
                     FROM episodes
                     WHERE user_id = %s AND workspace_id = %s
                       AND created_at BETWEEN %s AND %s
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, id ASC
                     LIMIT 20
                     """,
                     (data.user_id, data.workspace_id, start_time, end_time)
@@ -464,23 +567,33 @@ async def retrieve_context(
                 dt = dt.replace(tzinfo=timezone.utc)
             return start_time <= dt <= end_time
 
-        vector_results = [r for r in vector_results if in_range(r['created_at'])]
-        keyword_results = [r for r in keyword_results if in_range(r['created_at'])]
-        episode_results = [r for r in episode_results if in_range(r['created_at'])]
+        vector_results = [r for r in vector_results if in_range(r.get('occurred_at', r['created_at']))]
+        keyword_results = [r for r in keyword_results if in_range(r.get('occurred_at', r['created_at']))]
+        episode_results = [r for r in episode_results if in_range(r.get('occurred_at', r['created_at']))]
 
     # 6. Reciprocal Rank Fusion (RRF)
-    vector_rank = {str(row['id']): idx for idx, row in enumerate(vector_results)}
-    keyword_rank = {str(row['id']): idx for idx, row in enumerate(keyword_results)}
-    episode_rank = {str(row['id']): idx for idx, row in enumerate(episode_results)}
+    vector_rank = {doc_id: idx for idx, doc_id in enumerate(_ranked_ids(vector_results))}
+    keyword_rank = {doc_id: idx for idx, doc_id in enumerate(_ranked_ids(keyword_results))}
+    episode_rank = {doc_id: idx for idx, doc_id in enumerate(_ranked_ids(episode_results))}
 
-    all_keys = set(vector_rank.keys()).union(set(keyword_rank.keys())).union(set(episode_rank.keys()))
+    all_keys = list(dict.fromkeys([*vector_rank, *keyword_rank, *episode_rank]))
 
     info_map = {}
     for r in vector_results:
         info_map[str(r['id'])] = r
     for r in keyword_results:
-        if str(r['id']) not in info_map:
-            info_map[str(r['id'])] = r
+        doc_id = str(r['id'])
+        if doc_id not in info_map:
+            info_map[doc_id] = r
+        else:
+            # Candidate generation keeps the best dense metadata, but lexical
+            # evidence is an independent relevance signal and must not be
+            # discarded merely because that memory also appeared in vector
+            # search.
+            info_map[doc_id]["sparse_match_score"] = max(
+                float(info_map[doc_id].get("sparse_match_score", 0) or 0),
+                float(r.get("sparse_match_score", 0) or 0),
+            )
     for r in episode_results:
         if str(r['id']) not in info_map:
             info_map[str(r['id'])] = {
@@ -489,8 +602,36 @@ async def retrieve_context(
                 "memory_type": "EPISODIC",
                 "importance_score": r["importance_score"],
                 "frequency_count": r["frequency_count"],
-                "created_at": r["created_at"]
+                "created_at": r["created_at"],
+                "occurred_at": r.get("occurred_at", r["created_at"]),
+                "last_accessed_at": r.get("last_accessed_at", r["created_at"])
             }
+
+    # Provenance is loaded separately so vector, sparse, and episode queries
+    # stay focused on candidate generation. Episode IDs simply produce no rows.
+    if all_keys:
+        source_ids_by_memory = {}
+        try:
+            conn = get_postgres_conn()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT memory_id, source_event_id
+                    FROM memory_sources
+                    WHERE memory_id = ANY(%s::uuid[])
+                    ORDER BY occurred_at ASC, source_event_id ASC
+                    """,
+                    (all_keys,),
+                )
+                for row in cur.fetchall():
+                    memory_id = str(row["memory_id"])
+                    source_ids_by_memory.setdefault(memory_id, []).append(row["source_event_id"])
+            conn.close()
+        except Exception:
+            logger.exception("Could not load memory provenance for retrieval results")
+        for memory_id, source_event_ids in source_ids_by_memory.items():
+            if memory_id in info_map:
+                info_map[memory_id]["source_event_ids"] = source_event_ids
 
     rrf_candidates = []
     for doc_id in all_keys:
@@ -505,6 +646,15 @@ async def retrieve_context(
         if any(ent in content_lower for ent in expanded_entities):
             score *= 1.2
 
+        # RRF alone can tie a lexical exact match with an unrelated dense
+        # candidate (especially with a small or newly changed embedding
+        # model).  Preserve sparse term coverage as a bounded, transparent
+        # signal so an exact query match survives candidate truncation and is
+        # then judged by the reranker.
+        sparse_matches = float(info_map[doc_id].get("sparse_match_score", 0) or 0)
+        if sparse_matches:
+            score += 0.03 * min(sparse_matches, 3.0)
+
         rrf_candidates.append((doc_id, score))
 
     rrf_candidates.sort(key=lambda x: x[1], reverse=True)
@@ -515,53 +665,56 @@ async def retrieve_context(
     stm_ids = {item["memory_id"] for item in stm_items}
 
     final_items = []
+    rrf_rank_scores = _normalized_rank_scores([doc_id for doc_id, _ in top_candidates])
+
+    def append_memory_item(doc_id: str, relevance_score: float) -> None:
+        item_info = info_map[doc_id]
+        created_val = item_info['created_at']
+        created_str = created_val.isoformat() if hasattr(created_val, "isoformat") else str(created_val)
+        occurred_val = item_info.get("occurred_at") or created_val
+        occurred_str = occurred_val.isoformat() if hasattr(occurred_val, "isoformat") else str(occurred_val)
+        mem_type = item_info.get('memory_type', 'EPISODIC') or 'EPISODIC'
+        freshness = calculate_decay_strength(
+            item_info.get("last_accessed_at") or created_val,
+            item_info.get("importance_score", 0.50),
+            item_info.get("frequency_count", 1),
+        )
+        score = _apply_freshness_to_relevance(relevance_score, freshness)
+        if doc_id in stm_ids:
+            score *= 1.5
+        score = min(1.0, apply_goal_boost(item_info['content'], mem_type, score, goal_category))
+        m_scores = compile_multidimensional_scores(item_info, score, "user")
+        final_items.append({
+            "memory_id": doc_id,
+            "content": item_info['content'],
+            "score": score,
+            "type": mem_type,
+            "created_at": created_str,
+            "occurred_at": occurred_str,
+            "source_event_ids": item_info.get("source_event_ids", []),
+            **m_scores
+        })
+
     if top_candidates:
-        pairs = [(embedding_query, info_map[doc_id]['content']) for doc_id, _ in top_candidates]
+        pairs = [(data.query, info_map[doc_id]['content']) for doc_id, _ in top_candidates]
         try:
             reranker = get_reranker_model()
             scores_res = reranker.predict(pairs)
             rerank_scores = scores_res.tolist() if hasattr(scores_res, "tolist") else list(scores_res)
+            reranked_ids = _rank_reranker_candidates(top_candidates, rerank_scores)
+            rerank_rank_scores = _normalized_rank_scores(reranked_ids)
 
-            for idx, (doc_id, _) in enumerate(top_candidates):
-                item_info = info_map[doc_id]
-                created_val = item_info['created_at']
-                created_str = created_val.isoformat() if hasattr(created_val, "isoformat") else str(created_val)
-                mem_type = item_info.get('memory_type', 'EPISODIC') or 'EPISODIC'
-                score = float(rerank_scores[idx])
-                if doc_id in stm_ids:
-                    score *= 1.5
-                score = apply_goal_boost(item_info['content'], mem_type, score, goal_category)
-                m_scores = compile_multidimensional_scores(item_info, score, "user")
-                final_items.append({
-                    "memory_id": doc_id,
-                    "content": item_info['content'],
-                    "score": score,
-                    "type": mem_type,
-                    "created_at": created_str,
-                    **m_scores
-                })
+            for doc_id, _ in top_candidates:
+                blended_relevance = (0.75 * rerank_rank_scores[doc_id]) + (0.25 * rrf_rank_scores[doc_id])
+                append_memory_item(doc_id, blended_relevance)
         except Exception as e:
             logger.error(f"Reranker failed: {e}. Falling back to RRF rankings.")
-            for doc_id, score in top_candidates:
-                item_info = info_map[doc_id]
-                created_val = item_info['created_at']
-                created_str = created_val.isoformat() if hasattr(created_val, "isoformat") else str(created_val)
-                mem_type = item_info.get('memory_type', 'EPISODIC') or 'EPISODIC'
-                rrf_score = float(score)
-                if doc_id in stm_ids:
-                    rrf_score *= 1.5
-                rrf_score = apply_goal_boost(item_info['content'], mem_type, rrf_score, goal_category)
-                m_scores = compile_multidimensional_scores(item_info, rrf_score, "user")
-                final_items.append({
-                    "memory_id": doc_id,
-                    "content": item_info['content'],
-                    "score": rrf_score,
-                    "type": mem_type,
-                    "created_at": created_str,
-                    **m_scores
-                })
+            for doc_id, _ in top_candidates:
+                append_memory_item(doc_id, rrf_rank_scores[doc_id])
 
-    # Append Graph statements to context results
+    # Graph statements enrich the returned context but do not compete with
+    # calibrated memory relevance through an arbitrary fixed score.
+    graph_items = []
     for index, stmt in enumerate(graph_statements):
         graph_item_info = {
             "importance_score": 0.85,
@@ -570,17 +723,18 @@ async def retrieve_context(
             "memory_type": "FACTUAL"
         }
         m_scores = compile_multidimensional_scores(graph_item_info, 0.85, "graph")
-        final_items.append({
+        graph_items.append({
             "memory_id": f"graph_{index}_{uuid.uuid4().hex[:8]}",
             "content": stmt,
             "score": 0.85,
             "type": "GRAPH_FACT",
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
             **m_scores
         })
 
     final_items.sort(key=lambda x: x['score'], reverse=True)
-    results = final_items[:data.limit]
+    results = (final_items + graph_items)[:data.limit]
 
     # 5.5 Check for matching workflows if query/goal suggests procedural intent
     procedural_items = []
@@ -677,20 +831,23 @@ async def retrieve_context(
     )
 
 @router.post("/v1/memories/decay")
-async def apply_decay(authorization: Optional[str] = Header(None)):
+async def apply_decay(
+    workspace_id: str = Query("default"),
+    authorization: Optional[str] = Header(None),
+):
     """
-    Executes scoring decay updates on memories.
-    Flag records as inactive when overall selection score is < 0.15.
+    Evaluates active memories for retrieval-time decay.
+    Ordinary long-term memories are never auto-deactivated by age alone.
     """
-    verify_workspace_key("default", authorization)
-    log_event("system", "default", "MEMORY_DECAYED", {})
+    verify_workspace_key(workspace_id, authorization)
+    log_event("system", workspace_id, "MEMORY_DECAYED", {})
     try:
-        decayed_count = _execute_decay_logic()
+        evaluated_count = _execute_decay_logic(workspace_id)
     except Exception as e:
         logger.error(f"Failed to run decay cron job: {e}")
         raise HTTPException(status_code=500, detail="Decay process failed.")
 
-    return {"status": "success", "archived_count": decayed_count}
+    return {"status": "success", "evaluated_count": evaluated_count, "archived_count": 0}
 
 @router.post("/v1/memories/consolidate")
 async def consolidate_memories(
@@ -772,11 +929,11 @@ async def consolidate_memories(
     if neo4j:
         try:
             dupes = neo4j.query(
-                "MATCH (e:Entity {workspace_id: $workspace_id}) "
+                "MATCH (e:Entity {workspace_id: $workspace_id, user_id: $user_id}) "
                 "WITH toLower(e.name) AS lname, collect(e) AS nodes "
                 "WHERE size(nodes) > 1 "
                 "RETURN lname, [n IN nodes | n.name] AS names",
-                {"workspace_id": workspace_id}
+                {"workspace_id": workspace_id, "user_id": user_id}
             )
             for dupe_group in dupes:
                 names = dupe_group.get("names", [])
@@ -784,11 +941,11 @@ async def consolidate_memories(
                     keep = names[0]
                     for remove in names[1:]:
                         neo4j.query(
-                            "MATCH (old:Entity {name: $old_name, workspace_id: $ws}) "
-                            "MATCH (keep:Entity {name: $keep_name, workspace_id: $ws}) "
+                            "MATCH (old:Entity {name: $old_name, workspace_id: $ws, user_id: $user_id}) "
+                            "MATCH (keep:Entity {name: $keep_name, workspace_id: $ws, user_id: $user_id}) "
                             "OPTIONAL MATCH (old)-[r]->() "
                             "DELETE r, old",
-                            {"old_name": remove, "keep_name": keep, "ws": workspace_id}
+                            {"old_name": remove, "keep_name": keep, "ws": workspace_id, "user_id": user_id}
                         )
                         entity_dedup_count += 1
         except Exception as e:
@@ -807,41 +964,56 @@ async def clear_all_memories(
     workspace_id: str = Query("default"),
     authorization: Optional[str] = Header(None)
 ):
-    """Transactional purging of user memories in SQL and Neo4j for a specific workspace."""
+    """Purge one user's durable records and queue idempotent graph erasure."""
     verify_workspace_key(workspace_id, authorization)
     try:
         conn = get_postgres_conn()
-        with conn.cursor() as cur:
+        deletion_id = str(uuid.uuid4())
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id FROM memories WHERE user_id = %s AND workspace_id = %s",
+                (user_id, workspace_id),
+            )
+            memory_ids = [str(row["id"]) for row in cur.fetchall()]
+            cur.execute(
+                """
+                INSERT INTO graph_deletion_outbox (id, user_id, workspace_id, memory_ids)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (deletion_id, user_id, workspace_id, json.dumps(memory_ids)),
+            )
             cur.execute("DELETE FROM memories WHERE user_id = %s AND workspace_id = %s", (user_id, workspace_id))
             cur.execute("DELETE FROM episodes WHERE user_id = %s AND workspace_id = %s", (user_id, workspace_id))
             cur.execute("DELETE FROM workflows WHERE user_id = %s AND workspace_id = %s", (user_id, workspace_id))
             cur.execute("DELETE FROM conversation_logs WHERE user_id = %s AND workspace_id = %s", (user_id, workspace_id))
+            cur.execute("DELETE FROM event_store WHERE user_id = %s AND workspace_id = %s", (user_id, workspace_id))
+            cur.execute("DELETE FROM background_jobs WHERE user_id = %s AND workspace_id = %s", (user_id, workspace_id))
+            cur.execute("DELETE FROM dead_letter_queue WHERE user_id = %s AND workspace_id = %s", (user_id, workspace_id))
         conn.commit()
         conn.close()
+        try:
+            stm_cache.clear(user_id, workspace_id)
+            working_memory.clear_register(user_id, workspace_id)
+        except Exception:
+            logger.exception("Durable purge committed, but local cache eviction failed")
 
-        neo4j = get_neo4j_conn()
-        if neo4j:
-            is_mock = getattr(neo4j, "is_mock", False)
-            if is_mock:
-                entities_to_keep = {k: v for k, v in _mock_graph_data["entities"].items() if v.get("workspace") != workspace_id}
-                _mock_graph_data["entities"] = entities_to_keep
-                rels_to_keep = [r for r in _mock_graph_data["relationships"] if r.get("workspace_id") != workspace_id]
-                _mock_graph_data["relationships"] = rels_to_keep
-            else:
-                neo4j.query(
-                    "MATCH (u:User {id: $user_id, workspace_id: $workspace_id}) "
-                    "DETACH DELETE u",
-                    {"user_id": user_id, "workspace_id": workspace_id}
-                )
-                neo4j.query(
-                    "MATCH (n {workspace_id: $workspace_id}) DETACH DELETE n",
-                    {"workspace_id": workspace_id}
-                )
+        try:
+            from memoryos.services.background import process_graph_deletion
+            graph_cleanup_completed = process_graph_deletion(deletion_id)
+        except Exception:
+            # The committed outbox row lets a durable worker finish this after
+            # a transient Neo4j or worker failure.
+            logger.exception("Durable purge committed; graph cleanup remains queued")
+            graph_cleanup_completed = False
     except Exception as e:
         logger.error(f"Failed to clear memories: {e}")
         raise HTTPException(status_code=500, detail="Hard deletion failed.")
 
-    return {"status": "success", "message": f"All memories for user {user_id} in workspace {workspace_id} purged successfully."}
+    return {
+        "status": "success" if graph_cleanup_completed else "accepted",
+        "graph_cleanup": "completed" if graph_cleanup_completed else "pending_retry",
+        "message": f"Memory data for user {user_id} in workspace {workspace_id} was purged.",
+    }
 
 @router.post("/v1/memories/reflect")
 async def trigger_reflection(data: MemoryReflect, authorization: Optional[str] = Header(None)):

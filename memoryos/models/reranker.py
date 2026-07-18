@@ -29,9 +29,16 @@ def get_reranker_model():
             config._reranker_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
             logger.info("Local CrossEncoder reranker model loaded successfully.")
         except Exception as e:
-            logger.warning(
-                f"Failed to load cross-encoder model ({e}). "
-                "Operating in Zero-Dependency Mock ML mode (MockRerankerModel)."
-            )
-            config._reranker_model = MockRerankerModel()
+            if os.getenv("MEMORYOS_ALLOW_MOCK_MODELS", "false").lower() == "true":
+                logger.warning(
+                    "Reranker model failed to load; using the explicitly enabled token-overlap mock model: %s",
+                    e,
+                )
+                config._reranker_model = MockRerankerModel()
+            else:
+                raise RuntimeError(
+                    "Unable to load the semantic reranker model. Install the full model image or set "
+                    "OFFLINE_MODE=true only for deterministic tests. To explicitly allow non-semantic "
+                    "development mocks, set MEMORYOS_ALLOW_MOCK_MODELS=true."
+                ) from e
     return config._reranker_model
