@@ -49,7 +49,8 @@ class MemoryIngestionService:
         all_entities = []
         all_relationships = []
         
-        for evt in events:
+        llm_extraction_max_events = max(0, int(os.getenv("MEMORYOS_LLM_INGEST_MAX_EVENTS", "3")))
+        for event_index, evt in enumerate(events):
             importance = calculate_importance(evt)
             memory_type = classify_memory(evt)
             try:
@@ -60,7 +61,13 @@ class MemoryIngestionService:
                 raise HTTPException(status_code=500, detail="Embedding model execution failed.")
             
             # Extract clause-specific graph data once
-            clause_graph = extract_entities_and_relationships(evt)
+            # A large pasted note can contain many atomic events. Preserve all
+            # of them as memories, but bound optional LLM graph extraction so
+            # a single note cannot exhaust a shared daily provider quota.
+            clause_graph = extract_entities_and_relationships(evt) if event_index < llm_extraction_max_events else {"entities": [], "relationships": []}
+            if not isinstance(clause_graph, dict):
+                logger.warning("Entity extractor returned a non-object payload; storing the memory without graph facts.")
+                clause_graph = {"entities": [], "relationships": []}
             clause_entities = clause_graph.get("entities", [])
             clause_relationships = clause_graph.get("relationships", [])
             

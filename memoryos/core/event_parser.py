@@ -3,6 +3,7 @@ import json
 import requests
 from memoryos.config import logger
 from memoryos.services.extractor import load_spacy_model
+from memoryos.services.llm_usage import consume_llm_request, LLMRateLimitExceeded
 
 # ──────────────────────────────────────────────────────────────────────
 # LLM Splitting Prompt
@@ -32,17 +33,20 @@ def _extract_events_via_llm_api(content: str) -> list | None:
     timeout = float(os.getenv("LLM_TIMEOUT", "15.0"))
     
     # ── Mode 1: OpenAI-compatible API ──
-    llm_api_base = os.getenv("LLM_API_BASE")
-    llm_api_key = os.getenv("LLM_API_KEY")
-    llm_model = os.getenv("LLM_MODEL")
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    azure_key = os.getenv("AZURE_OPENAI_API_KEY")
+    azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    is_azure = not bool(os.getenv("LLM_API_BASE") and os.getenv("LLM_API_KEY") and os.getenv("LLM_MODEL")) and bool(azure_endpoint and azure_key and azure_deployment)
+    llm_api_base = (f"{azure_endpoint.rstrip('/')}/openai/deployments/{azure_deployment}" if is_azure else os.getenv("LLM_API_BASE"))
+    llm_api_key = azure_key if is_azure else os.getenv("LLM_API_KEY")
+    llm_model = azure_deployment if is_azure else os.getenv("LLM_MODEL")
     
     if llm_api_base and llm_api_key and llm_model:
         try:
-            url = f"{llm_api_base.rstrip('/')}/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {llm_api_key}",
-                "Content-Type": "application/json"
-            }
+            consume_llm_request()
+            api_version = os.getenv("AZURE_OPENAI_API_VERSION") or os.getenv("AURE_OPENAI_VERSION") or "2024-10-21"
+            url = f"{llm_api_base.rstrip('/')}/chat/completions" + (f"?api-version={api_version}" if is_azure else "")
+            headers = ({"api-key": llm_api_key, "Content-Type": "application/json"} if is_azure else {"Authorization": f"Bearer {llm_api_key}", "Content-Type": "application/json"})
             payload = {
                 "model": llm_model,
                 "messages": [
@@ -61,6 +65,9 @@ def _extract_events_via_llm_api(content: str) -> list | None:
             else:
                 logger.warning(f"LLM API returned status {response.status_code}: {response.text[:200]}")
         except Exception as e:
+            if isinstance(e, LLMRateLimitExceeded):
+                logger.warning("LLM event parsing skipped because the daily request limit is exhausted.")
+                return None
             logger.warning(f"LLM API sentence splitting failed: {e}")
         return None
     

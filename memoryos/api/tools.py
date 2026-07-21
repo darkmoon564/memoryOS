@@ -2,9 +2,64 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Body, Header, HTTPException, Query
 from memoryos.schemas.memory import MemoryIngest, MemoryRetrieve
-from memoryos.api.memories import ingest_memory, retrieve_context
+from memoryos.api.memories import ingest_memory, retrieve_context, verify_workspace_key
+from memoryos.core.episodes import query_llm
+from memoryos.services.llm_usage import get_daily_usage
 
 router = APIRouter()
+
+
+@router.get("/v1/ceo/usage")
+async def get_ceo_llm_usage(
+    workspace_id: str = Query(...),
+    authorization: Optional[str] = Header(None),
+):
+    verify_workspace_key(workspace_id, authorization)
+    return get_daily_usage()
+
+
+@router.post("/v1/ceo/ask")
+async def ask_ceo_agent(
+    arguments: dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Answer an executive question using only tenant-scoped MemoryOS context."""
+    user_id = arguments.get("user_id")
+    workspace_id = arguments.get("workspace_id")
+    question = arguments.get("query")
+    if not user_id or not workspace_id or not question:
+        raise HTTPException(status_code=400, detail="user_id, workspace_id, and query are required.")
+
+    retrieval_data = MemoryRetrieve(
+        user_id=user_id,
+        workspace_id=workspace_id,
+        query=question,
+        limit=min(int(arguments.get("limit", 6)), 10),
+    )
+    retrieved = await retrieve_context(retrieval_data, authorization=authorization)
+    memories = [item.dict() for item in retrieved.results]
+    if not memories:
+        return {"answer": "I could not find relevant company context in MemoryOS yet.", "results": []}
+
+    context = "\n".join(
+        f"[{index}] {item['content']}"
+        for index, item in enumerate(memories, start=1)
+    )
+    system_prompt = (
+        "You are a clear, pragmatic startup CEO copilot. Answer only from the supplied MemoryOS context. "
+        "Do not invent facts, metrics, dates, or owners. State uncertainty where context is incomplete. "
+        "Be concise: the first sentence must answer the CEO's exact question directly and explicitly. "
+        "For example, if asked which customer needs attention, name the customer first, then explain why. "
+        "Follow with 2-4 short supporting points and a practical next action. "
+        "Use plain text only: no Markdown asterisks, headings, or tables."
+    )
+    answer = query_llm(
+        system_prompt,
+        f"CEO question: {question}\n\nRelevant MemoryOS context:\n{context}",
+    )
+    if not answer:
+        answer = "Relevant company context:\n" + "\n".join(f"- {item['content']}" for item in memories[:3])
+    return {"answer": answer, "results": memories}
 
 @router.get("/tools")
 async def mcp_list_tools():

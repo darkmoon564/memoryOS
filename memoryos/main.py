@@ -5,6 +5,7 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # Routers
 from memoryos.api.memories import router as memories_router
@@ -113,6 +114,17 @@ async def lifespan(app: FastAPI):
     close_neo4j_conn()
 
 app = FastAPI(title="AI Memory Operating System (MemoryOS)", version="1.2.0", lifespan=lifespan)
+
+# The bundled FounderOS demo is served separately during local development.
+# Keep this intentionally narrow so the API is not exposed to arbitrary browser
+# origins; production deployments should place their own frontend origin here.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:4173", "http://localhost:4173"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+)
 
 
 @app.middleware("http")
