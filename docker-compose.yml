@@ -63,13 +63,16 @@ services:
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env}
       MEMORYOS_ALLOW_IN_MEMORY_FALLBACK: "false"
-      OFFLINE_MODE: "${MEMORYOS_OFFLINE_MODE:-true}"
+      OFFLINE_MODE: "${MEMORYOS_OFFLINE_MODE:-false}"
     depends_on:
       postgres-db:
         condition: service_healthy
       neo4j-db:
         condition: service_healthy
     restart: "no"
+    volumes:
+      - ./memoryos:/app/memoryos:ro
+      - ./migrations:/app/migrations:ro
 
   api:
     build:
@@ -87,13 +90,23 @@ services:
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env}
       MEMORYOS_ALLOW_IN_MEMORY_FALLBACK: "false"
-      OFFLINE_MODE: "${MEMORYOS_OFFLINE_MODE:-true}"
+      MEMORYOS_ALLOW_MOCK_MODELS: "true"
+      OFFLINE_MODE: "${MEMORYOS_OFFLINE_MODE:-false}"
+      LLM_API_BASE: ${LLM_API_BASE:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-15}
+      LLM_DAILY_REQUEST_LIMIT: ${LLM_DAILY_REQUEST_LIMIT:-50}
+      MEMORYOS_LLM_INGEST_MAX_EVENTS: ${MEMORYOS_LLM_INGEST_MAX_EVENTS:-3}
     ports:
       - "127.0.0.1:${MEMORYOS_PORT:-8088}:8088"
     depends_on:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+    volumes:
+      - ./memoryos:/app/memoryos:ro
+      - ./migrations:/app/migrations:ro
 
   worker:
     build:
@@ -116,6 +129,9 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+    volumes:
+      - ./memoryos:/app/memoryos:ro
+      - ./migrations:/app/migrations:ro
 
 volumes:
   postgres_data:
