@@ -4,6 +4,16 @@ MemoryOS is a local-first, modular long-term memory framework designed to give A
 
 By combining dense semantic vector search, sparse keyword matching, and a relational knowledge graph, MemoryOS behaves like an externalized hippocampal-cortex system for your agents.
 
+## Hackathon demo: FounderOS
+
+FounderOS is a small startup-CEO agent built on top of MemoryOS for this hackathon. It is a demonstration of the core MemoryOS capability: an AI application can retrieve connected, durable context instead of relying only on the current chat window.
+
+The demo brings together a company's customers, roadmap, investor meetings, metrics, Slack discussions, and GitHub issues. It then uses MemoryOS retrieval to answer questions such as “Which customer needs my attention?” with context that spans those sources. The FounderOS frontend lives in [`startup-ceo-agent`](startup-ceo-agent/).
+
+## How Codex and GPT-5.6 were used
+
+We used Codex with GPT-5.6 as a development collaborator to build FounderOS on top of MemoryOS. Codex helped implement the CEO question endpoint, connect retrieval-grounded context to the LLM response flow, add durable daily LLM usage limits, configure the local frontend-to-API integration, troubleshoot Docker and database startup issues, and prepare the project documentation. GPT-5.6 and Codex were used during development for implementation, debugging, iteration, and integration; the resulting API routes, migration, safeguards, and tests are inspectable in this repository.
+
 ---
 
 ## 🌟 Key Features
@@ -58,6 +68,10 @@ OLLAMA_MODEL=llama3.2
 
 # Timeout for LLM calls in seconds (default: 15)
 LLM_TIMEOUT=15
+
+# Maximum provider-backed LLM requests shared by this deployment each day
+# (default: 50). Local Ollama calls are not counted.
+LLM_DAILY_REQUEST_LIMIT=50
 ```
 *Note: If no LLM is available, MemoryOS falls back to a local **spaCy dependency parser** for entity extraction. PostgreSQL and Neo4j are required for a durable deployment; the in-memory adapters are test-only and must be explicitly enabled.*
 
@@ -83,7 +97,7 @@ That image downloads CPU PyTorch, sentence-transformer models, and spaCy assets,
 
 MemoryOS uses tracked, forward-only migrations. For a new database run `python -m memoryos.migrations bootstrap`; for an existing database, back it up and run `python -m memoryos.migrations upgrade`. Use `python -m memoryos.migrations status` in deployment checks. `0001` replaces stored plaintext keys with SHA-256 lookup hashes; `0002` adds the durable graph-projection queue. Callers continue sending the original API key in the Bearer header.
 
-Version `0005` adds durable, per-user graph-erasure work and all newly written graph nodes carry both `workspace_id` and `user_id`. Graph nodes produced by releases before this migration cannot be safely attributed retrospectively; rebuild those legacy graphs from the event store after upgrading rather than attempting an automated shared-workspace cleanup. Version `0006` adds source-event timestamps and durable memory-to-source provenance. Existing records are backfilled from their creation timestamps; new ingests should provide the original event time whenever it is known.
+Version `0005` adds durable, per-user graph-erasure work and all newly written graph nodes carry both `workspace_id` and `user_id`. Graph nodes produced by releases before this migration cannot be safely attributed retrospectively; rebuild those legacy graphs from the event store after upgrading rather than attempting an automated shared-workspace cleanup. Version `0006` adds source-event timestamps and durable memory-to-source provenance. Existing records are backfilled from their creation timestamps; new ingests should provide the original event time whenever it is known. Version `0007` adds durable deployment-wide daily LLM usage tracking; configure `LLM_DAILY_REQUEST_LIMIT` to control the request budget.
 
 Older development builds could also create ignored `archive/archived_logs_*.jsonl` files during reflection. MemoryOS no longer writes them because they bypass durable deletion. Review and remove any legacy archive files under your own retention policy before treating an upgraded deployment as fully purged.
 
@@ -144,6 +158,25 @@ make replay safe and returned as `source_event_ids` with retrieved memories.
   "workspace_id": "production_workspace"
 }
 ```
+
+### FounderOS CEO Agent
+
+`POST /v1/ceo/ask` retrieves tenant-scoped MemoryOS context before generating a
+concise CEO-copilot answer. It requires the same workspace Bearer key as the
+memory APIs.
+
+```json
+{
+  "user_id": "founder_demo",
+  "workspace_id": "production_workspace",
+  "query": "Which customer needs my attention?",
+  "limit": 6
+}
+```
+
+`GET /v1/ceo/usage?workspace_id=production_workspace` returns the current
+deployment-wide LLM request budget. The daily limit is shared by the configured
+LLM provider deployment rather than enforced separately per user or workspace.
 
 ### Consolidate & Deduplicate
 `POST /v1/memories/consolidate`

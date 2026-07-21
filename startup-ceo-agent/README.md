@@ -21,7 +21,7 @@ Open **Memory connection** in the app and enter:
 - User ID: the MemoryOS user whose company context you are demoing
 - API key: your workspace key
 
-The app calls `POST /v1/memories` to save new company context and `POST /v1/memories/retrieve` to answer CEO questions from MemoryOS. It retrieves only context belonging to the selected User ID. Until configured, it runs with a realistic local demo dataset.
+The app calls `POST /v1/memories` to save new company context and `POST /v1/memories/retrieve` to answer CEO questions from MemoryOS. It retrieves only context belonging to the selected User ID. Configure a running MemoryOS instance before using the live CEO-agent features.
 
 ## What it remembers
 
